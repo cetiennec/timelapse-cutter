@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timelapse Cutter</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Timelapse Cutter</div>
+  <div class="group">
+    <button data-add="A" class="btn">＋ <span class="tname" data-track="A">Camera A</span></button>
+    <button data-add="B" class="btn">＋ <span class="tname" data-track="B">Camera B</span></button>
+  </div>
+  <div class="group">
+    <label class="inline">Align
+      <select id="alignMode">
+        <option value="creation">by recording time (metadata)</option>
+        <option value="mtime">by file modified time (= end)</option>
+        <option value="name">by date in file name</option>
+        <option value="sequential">back to back</option>
+      </select>
+    </label>
+    <button id="alignBtn" class="btn">Align clips</button>
+    <button id="syncBtn" class="btn" title="Shift each camera A clip so its activity matches camera B (fixes camera clocks that are off)">Sync A to B from footage</button>
+  </div>
+  <div class="spacer"></div>
+  <div id="stats" class="stats"></div>
+  <span id="saveState" class="muted small"></span>
+  <button id="exportBtn" class="btn primary">Export…</button>
+</header>
+
+<main class="workspace">
+  <section class="viewer">
+    <div class="stage-wrap" id="stageWrap">
+      <div class="stage" id="stage">
+        <video id="vA" muted playsinline preload="auto"></video>
+        <video id="vB" muted playsinline preload="auto"></video>
+        <div class="stage-empty" id="stageEmpty">
+          <p>Add the videos from your two cameras to start.</p>
+          <div><button data-add="A" class="btn">＋ Camera A</button> <button data-add="B" class="btn">＋ Camera B</button></div>
+        </div>
+        <canvas class="stage-fade" id="fadeCanvas"></canvas>
+        <div class="stage-cut" id="stageCut">CUT</div>
+      </div>
+    </div>
+    <div class="transport">
+      <button id="prevBtn" class="icon" title="Previous kept part">⏮</button>
+      <button id="playBtn" class="icon play" title="Play / pause (space)">▶</button>
+      <button id="nextBtn" class="icon" title="Next kept part">⏭</button>
+      <button id="splitBtn2" class="icon" title="Split at playhead (⌘B)">✂</button>
+      <div class="timecode"><span id="tcVideo">00:00:00</span><span id="tcReal" class="muted"></span></div>
+      <div class="spacer"></div>
+      <label class="inline"><input type="checkbox" id="skipCuts" checked> Skip cut parts</label>
+      <label class="inline">Speed
+        <select id="speed">
+          <option value="0.25">¼×</option><option value="0.5">½×</option><option value="1" selected>1×</option>
+          <option value="2">2×</option><option value="4">4×</option><option value="8">8×</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <aside class="inspector">
+    <details open>
+      <summary>Layout (default)</summary>
+      <div class="seg" id="modeSeg">
+        <button data-mode="pip">Picture in picture</button>
+        <button data-mode="sbs">Side by side</button>
+        <button data-mode="stack">Stacked</button>
+        <button data-mode="blend">Superpose</button>
+        <button data-mode="A">A only</button>
+        <button data-mode="B">B only</button>
+      </div>
+      <div class="opt" data-for="pip">
+        <label>Main camera
+          <select id="pipMain"><option value="A">A</option><option value="B">B</option></select></label>
+        <label>Corner
+          <select id="pipCorner"><option value="tl">top left</option><option value="tr">top right</option>
+            <option value="bl">bottom left</option><option value="br">bottom right</option></select></label>
+        <label>Inset size <input type="range" id="pipSize" min="0.15" max="0.5" step="0.01"><output id="pipSizeOut"></output></label>
+        <label>Border <input type="range" id="pipBorder" min="0" max="12" step="1"><output id="pipBorderOut"></output></label>
+      </div>
+      <div class="opt" data-for="blend">
+        <label>B opacity <input type="range" id="blendOp" min="0.05" max="0.95" step="0.05"><output id="blendOpOut"></output></label>
+      </div>
+      <label class="check"><input type="checkbox" id="fill"> Crop to fill (no black bars)</label>
+      <p class="hint">When only one camera has footage, it is shown full frame. Change the layout of one part in Edit below.</p>
+    </details>
+
+    <details open>
+      <summary>Remove still parts</summary>
+      <label class="check"><input type="checkbox" id="autoCut"> Cut automatically when both cameras are still</label>
+      <label>Sensitivity <input type="range" id="sens" min="1.2" max="8" step="0.1"><output id="sensOut"></output></label>
+      <label>Still for at least <input type="range" id="minStill" min="0.5" max="30" step="0.5"><output id="minStillOut"></output></label>
+      <label>Keep around activity <input type="range" id="pad" min="0" max="120" step="2"><output id="padOut"></output></label>
+      <p class="hint" id="detectInfo">Orange in the activity graph = something changes. The dashed line is the threshold.</p>
+      <div class="row wrap">
+        <button id="deleteStillBtn" class="btn primary" title="Cut every still part and remove the cut parts from the timeline">Delete still parts</button>
+        <button id="forgetKeepsBtn" class="btn small" hidden>Forget restored parts</button>
+      </div>
+    </details>
+
+    <details open>
+      <summary>Transitions</summary>
+      <label>Between sessions <input type="range" id="trSession" min="0" max="30" step="1"><output id="trSessionOut"></output></label>
+      <label>At cuts <input type="range" id="trCut" min="0" max="15" step="1"><output id="trCutOut"></output></label>
+      <p class="hint" id="trInfo">Cross-dissolves where the footage jumps. Sessions = a camera switches to another clip.</p>
+    </details>
+
+    <details open>
+      <summary>Edit</summary>
+      <p class="hint" id="selInfo"></p>
+      <div class="row wrap">
+        <button id="splitBtn" class="btn" title="⌘B">Split at playhead</button>
+        <button id="deleteBtn" class="btn" title="⌫">Delete</button>
+        <button id="restoreSelBtn" class="btn">Restore</button>
+      </div>
+      <label>Layout here
+        <select id="pieceLayout">
+          <option value="">Default</option>
+          <option value="pip:A">Picture in picture — A main</option>
+          <option value="pip:B">Picture in picture — B main</option>
+          <option value="sbs">Side by side</option>
+          <option value="stack">Stacked</option>
+          <option value="blend">Superpose</option>
+          <option value="A">A only</option>
+          <option value="B">B only</option>
+        </select>
+      </label>
+      <div class="row wrap">
+        <button id="swapBtn" class="btn" title="W">⇄ Swap PiP here</button>
+        <button id="hideABtn" class="btn">Hide A here</button>
+        <button id="hideBBtn" class="btn">Hide B here</button>
+        <button id="unhideBtn" class="btn">Unhide</button>
+      </div>
+    </details>
+
+    <details open id="clipPanel">
+      <summary>Clip</summary>
+      <div id="clipInfo" class="hint">Click a clip on the timeline.</div>
+    </details>
+  </aside>
+</main>
+
+<section class="timeline">
+  <div class="tl-bar">
+    <button id="zoomOut" class="icon small" title="Zoom out (−)">−</button>
+    <button id="zoomFit" class="btn small" title="Fit (0)">Fit</button>
+    <button id="zoomIn" class="icon small" title="Zoom in (+)">+</button>
+    <button id="compactBtn" class="btn small toggle" title="Remove the cut parts from the timeline (H)">Hide cut parts</button>
+    <span class="muted small tl-help">⌘B split · click a piece, ⌫ delete · drag empty track: select range · drag clip: move (⌥ whole track) · click red, ⌫: restore · double-click a split on the ruler: remove · ⌘Z undo</span>
+  </div>
+  <canvas id="tl"></canvas>
+</section>
+
+<dialog id="addDlg">
+  <form method="dialog">
+    <h3>Add videos to <span id="addTrackName"></span></h3>
+    <button type="button" id="pickBtn" class="btn primary">Choose files…</button>
+    <p class="hint">…or paste file / folder paths, one per line:</p>
+    <textarea id="addPaths" rows="5" placeholder="/Users/me/Movies/camA/"></textarea>
+    <p class="err" id="addErr"></p>
+    <div class="row end">
+      <button value="cancel" class="btn">Close</button>
+      <button type="button" id="addPathsBtn" class="btn primary">Add paths</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="syncDlg">
+  <form method="dialog">
+    <h3>Sync from footage</h3>
+    <pre id="syncReport" class="report"></pre>
+    <p class="hint">Undo with ⌘Z. Clips with little shared activity are left where they are; use “Sync to other camera” on one clip, or drag it.</p>
+    <div class="row end"><button value="close" class="btn primary">OK</button></div>
+  </form>
+</dialog>
+
+<dialog id="exportDlg">
+  <form method="dialog">
+    <h3>Export</h3>
+    <label>File <input type="text" id="exPath" spellcheck="false"></label>
+    <label>Resolution
+      <select id="exRes">
+        <option value="1920x1080">1920 × 1080 (16:9)</option>
+        <option value="3840x2160">3840 × 2160 (4K)</option>
+        <option value="1280x720">1280 × 720</option>
+        <option value="3840x1080">3840 × 1080 (wide, good for side by side)</option>
+        <option value="1080x1920">1080 × 1920 (vertical)</option>
+        <option value="1080x1080">1080 × 1080 (square)</option>
+      </select>
+    </label>
+    <label>Encoder
+      <select id="exEnc">
+        <option value="x264">H.264 — best quality (x264)</option>
+        <option value="videotoolbox">H.264 — fast (Apple hardware)</option>
+      </select>
+    </label>
+    <label>Speed
+      <select id="exSpeed">
+        <option value="1">1× (as recorded)</option><option value="1.5">1.5×</option>
+        <option value="2">2×</option><option value="3">3×</option><option value="4">4×</option>
+      </select>
+    </label>
+    <p class="hint" id="exSummary"></p>
+    <div class="progress" id="exProgress" hidden><div></div></div>
+    <p class="hint" id="exStatus"></p>
+    <div class="row end">
+      <button value="cancel" class="btn" id="exClose">Close</button>
+      <button type="button" class="btn" id="exCancel" hidden>Stop</button>
+      <button type="button" class="btn" id="exReveal" hidden>Show in Finder</button>
+      <button type="button" class="btn primary" id="exStart">Export</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
