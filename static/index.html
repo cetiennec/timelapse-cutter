@@ -26,6 +26,8 @@
     <button id="syncBtn" class="btn" title="Shift each camera A clip so its activity matches camera B (fixes camera clocks that are off)">Sync A to B from footage</button>
   </div>
   <div class="spacer"></div>
+  <div id="missingBar" class="missing" hidden>⚠ <span id="missingCount"></span>
+    <button id="relinkBtn" class="btn small">Find moved files</button></div>
   <div id="stats" class="stats"></div>
   <span id="saveState" class="muted small"></span>
   <button id="exportBtn" class="btn primary">Export…</button>
@@ -41,6 +43,8 @@
           <p>Add the videos from your two cameras to start.</p>
           <div><button data-add="A" class="btn">＋ Camera A</button> <button data-add="B" class="btn">＋ Camera B</button></div>
         </div>
+        <div class="stage-msg" id="msgA"></div>
+        <div class="stage-msg" id="msgB"></div>
         <canvas class="stage-fade" id="fadeCanvas"></canvas>
         <div class="stage-cut" id="stageCut">CUT</div>
       </div>
@@ -173,7 +177,7 @@
   <form method="dialog">
     <h3>Sync from footage</h3>
     <pre id="syncReport" class="report"></pre>
-    <p class="hint">Undo with ⌘Z. Clips with little shared activity are left where they are; use “Sync to other camera” on one clip, or drag it.</p>
+    <p class="hint" id="dlgHint"></p>
     <div class="row end"><button value="close" class="btn primary">OK</button></div>
   </form>
 </dialog>

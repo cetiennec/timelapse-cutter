@@ -28,6 +28,10 @@ Run the same command again to continue where you left off.
   match camera B's (in 25-min windows, median of the confident ones) and moves the clip. Clips with no
   overlap take the shift of the nearest measured clip of the same day. A report lists every move; ⌘Z undoes
   it. **Sync to other camera** in the Clip panel does the same for one clip.
+- **Missing files.** If a video file is moved, renamed or deleted, the app tells you right away (pop-up and
+  a ⚠ in the top bar), marks the clip “file missing” on the timeline and in the preview, and refuses to
+  export it. **Find moved files** relinks clips by file name and size (Spotlight, then the other clips'
+  folders, Desktop, Downloads and Movies).
 - **Layout.** Picture in picture (main camera, corner, size, border), side by side, stacked, superpose
   (B blended over A with an opacity), or one camera only. When only one camera has footage at a moment,
   it fills the frame. The preview shows what the export will look like.

@@ -9,6 +9,7 @@ const TRACKS = ['A', 'B'];
 let S = null;            // project state (mirrors project.json)
 let AN = {};             // analysis status per clip id
 let PROJECT_DIR = '';
+let MISSING = new Set();  // clip ids whose video file is not where the project expects it
 const DIFFS = {};        // clip id -> { smooth: Float32Array, thumbEvery, nThumbs }
 const THUMBS = new Map();
 let THR = { A: 1, B: 1 };
@@ -332,6 +333,19 @@ function place(v, x, y, w, h, z, opacity = 1, fit = 'contain', border = 0) {
 }
 
 function layoutStage(ca, cb) {
+  layoutVideos(ca, cb);
+  for (const [tr, c] of [['A', ca], ['B', cb]]) {
+    const m = $(`#msg${tr}`), v = vids[tr];
+    const show = c && MISSING.has(c.id) && v.style.display === 'block';
+    m.style.display = show ? 'flex' : 'none';
+    if (show) {
+      for (const k of ['left', 'top', 'width', 'height', 'zIndex']) m.style[k] = v.style[k];
+      m.textContent = `Camera ${tr}: file missing — ${c.name}`;
+    }
+  }
+}
+
+function layoutVideos(ca, cb) {
   const L = layoutAt(ui.t);
   const fit = L.fill ? 'cover' : 'contain';
   let show = [ca && 'A', cb && 'B'].filter(Boolean);
@@ -359,6 +373,9 @@ function syncVideo(tr, clip) {
   const v = vids[tr];
   if (!clip) { if (!v.paused) v.pause(); return; }
   if (v._clip !== clip.id) {
+    // Switching files blanks the element until the new one is decoded: freeze the
+    // current picture on top meanwhile instead of flashing black.
+    if (v.style.display === 'block' && v.readyState >= 2) startFade(0, true);
     v._clip = clip.id; v._ready = false;
     v.src = `/media/${clip.id}`;
     v.onloadedmetadata = () => { v._ready = true; };
@@ -366,9 +383,17 @@ function syncVideo(tr, clip) {
   if (!v._ready) return;
   const want = clamp(ui.t - clip.start, 0, Math.max(0, (v.duration || clip.duration) - 0.001));
   if (ui.playing) {
-    if (v.playbackRate !== ui.speed) v.playbackRate = ui.speed;
     if (v.paused) v.play().catch(() => {});
-    if (Math.abs(v.currentTime - want) > 0.25 * Math.max(1, ui.speed)) v.currentTime = want;
+    const drift = v.currentTime - want;   // seconds of video, > 0 = ahead
+    if (Math.abs(drift) > Math.max(1, 0.5 * ui.speed)) {
+      v.currentTime = want;               // far off (e.g. after a stall): jump
+      v.playbackRate = ui.speed;
+    } else {
+      // Close: speed up / slow down slightly so it catches up within about a second,
+      // keeping both cameras within a frame or two instead of a seek tolerance.
+      const rate = clamp(ui.speed - drift, ui.speed * 0.5, ui.speed * 1.5);
+      if (Math.abs(v.playbackRate - rate) > 0.005) v.playbackRate = rate;
+    }
   } else {
     if (!v.paused) v.pause();
     if (!v.seeking && Math.abs(v.currentTime - want) > 0.5 / fps()) v.currentTime = want;
@@ -414,7 +439,13 @@ function tick(now) {
       maybeDissolve(before, ui.t);
       followPlayhead();
     }
-    if (ui.fade) {
+    if (ui.fade && ui.fade.hold) {
+      const ready = TRACKS.every((tr) => {
+        const v = vids[tr];
+        return v.style.display !== 'block' || MISSING.has(v._clip) || (v._ready && v.readyState >= 2 && !v.seeking);
+      });
+      if (ready || now - ui.fade.t0 > 4000) ui.fade = { t0: now, dur: 150 };
+    } else if (ui.fade) {
       const p = (now - ui.fade.t0) / ui.fade.dur;
       if (p >= 1) stopFade(); else fadeCv.style.opacity = 1 - p;
     }
@@ -433,7 +464,7 @@ function tick(now) {
 // Preview dissolve: freeze the outgoing picture on a canvas and fade it out
 // over the new footage (close enough to the exported cross-fade).
 const fadeCv = $('#fadeCanvas');
-function startFade(dur) {
+function startFade(dur, hold = false) {
   const st = $('#stage'), dpr = window.devicePixelRatio || 1;
   const W = st.clientWidth, H = st.clientHeight;
   fadeCv.width = W * dpr; fadeCv.height = H * dpr;
@@ -456,7 +487,7 @@ function startFade(dur) {
       g.strokeStyle = '#fff'; g.lineWidth = b; g.strokeRect(x - b / 2, y - b / 2, w + b, h + b);
     }
   }
-  ui.fade = { t0: performance.now(), dur: Math.max(0.08, dur) * 1000 };
+  ui.fade = { t0: performance.now(), dur: Math.max(0.08, dur) * 1000, hold };
   fadeCv.style.opacity = 1;
 }
 function stopFade() { ui.fade = null; fadeCv.style.opacity = 0; }
@@ -790,6 +821,11 @@ function drawClip(g, c, x0, x1, y, W) {
     const msg = a && a.status === 'error' ? `analysis failed: ${a.error || ''}` :
       `analysing… ${a ? Math.round((a.progress || 0) * 100) : 0}%`;
     g.fillText(msg, Math.max(x0, LABEL_W) + 6, ty + th / 2 + 4);
+  }
+  if (MISSING.has(c.id)) {
+    g.fillStyle = 'rgba(120,10,20,0.75)'; g.fillRect(x0, y + NAME_H, x1 - x0, TRACK_H - NAME_H);
+    g.fillStyle = '#fff'; g.font = '600 11px -apple-system';
+    g.fillText('file missing', Math.max(x0, LABEL_W) + 6, y + NAME_H + 18);
   }
   // name bar
   g.fillStyle = 'rgba(0,0,0,0.55)'; g.fillRect(x0, y, x1 - x0, NAME_H);
@@ -1141,6 +1177,8 @@ function syncFromFootage(clips) {
     if (min < 0) shiftProject(-min);
     changed();
   }
+  $('#syncDlg h3').textContent = 'Sync from footage';
+  $('#dlgHint').textContent = 'Undo with ⌘Z. Clips with little shared activity are left where they are; use “Sync to other camera” on one clip, or drag it.';
   $('#syncReport').textContent = lines.join('\n') || 'Nothing to sync.';
   $('#syncDlg').showModal();
 }
@@ -1435,11 +1473,44 @@ async function poll() {
       if (a.status === 'done' && !DIFFS[id] && S.clips.some((c) => c.id === id)) loadDiffs(id);
     }
     AN = st.analysis;
+    setMissing(st.missing || []);
     if (redraw) { drawDirty = true; if (ui.selClip) renderClipInfo(); }
     renderExport(st.export || {});
   } catch (e) { /* server restarting */ }
   setTimeout(poll, 1000);
 }
+
+function setMissing(ids) {
+  const next = new Set(ids);
+  if (next.size === MISSING.size && ids.every((id) => MISSING.has(id))) return;
+  // Files that came back: make the preview reload them.
+  for (const v of Object.values(vids)) if (MISSING.has(v._clip) && !next.has(v._clip)) v._clip = null;
+  const fresh = ids.filter((id) => !MISSING.has(id));
+  MISSING = next;
+  if (fresh.length && !$('#syncDlg').open) {
+    const list = fresh.map((id) => S.clips.find((c) => c.id === id)).filter(Boolean)
+      .map((c) => `${c.name}  (camera ${c.track})\n    expected in ${c.path.slice(0, c.path.lastIndexOf('/'))}`);
+    $('#syncDlg h3').textContent = `⚠ ${fresh.length} video file${fresh.length > 1 ? 's' : ''} not found`;
+    $('#dlgHint').textContent = '';
+    $('#syncReport').textContent = `${list.join('\n')}\n\nThey were moved, renamed or deleted. These parts show as “file missing” and can't be exported.\nUse “Find moved files” in the top bar to relink them automatically, or put them back.`;
+    $('#syncDlg').showModal();
+  }
+  $('#missingBar').hidden = !MISSING.size;
+  $('#missingCount').textContent = `${MISSING.size} video file${MISSING.size > 1 ? 's' : ''} missing`;
+  drawDirty = true;
+}
+$('#relinkBtn').onclick = async () => {
+  const r = await api('/api/relink', {});
+  for (const c of r.state.clips) { const mine = S.clips.find((x) => x.id === c.id); if (mine) mine.path = c.path; }
+  setMissing(r.missing);
+  $('#syncDlg h3').textContent = 'Find moved files';
+  $('#dlgHint').textContent = r.lost.length ? 'Put the missing files back, or remove those clips from the project (Clip panel → Remove).' : '';
+  $('#syncReport').textContent = [
+    ...r.found.map((f) => `found  ${f}`),
+    ...r.lost.map((f) => `still missing  ${f} (not found with the same name and size)`),
+  ].join('\n') || 'Nothing was missing.';
+  $('#syncDlg').showModal();
+};
 
 // ------------------------------------------------------------------ keyboard
 
@@ -1475,6 +1546,7 @@ window.addEventListener('keydown', (e) => {
 async function boot() {
   const r = await api('/api/state');
   S = r.state; AN = r.analysis; PROJECT_DIR = r.projectDir;
+  setMissing(r.missing || []);
   S.cuts = normCuts(S.cuts || []);
   S.hidden = S.hidden || { A: [], B: [] };
   S.keeps = S.keeps || [];

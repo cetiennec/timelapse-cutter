@@ -107,6 +107,45 @@ def clip_by_id(cid):
     return None
 
 
+def missing_ids():
+    return [c["id"] for c in STATE["clips"] if not os.path.isfile(c["path"])]
+
+
+def search_dirs():
+    """Folders to look in when Spotlight finds nothing: the other clips' folders and
+    their parents' subfolders, Desktop, Downloads, and Movies (two levels deep)."""
+    home = os.path.expanduser("~")
+    dirs = {os.path.dirname(c["path"]) for c in STATE["clips"]}
+    roots = {os.path.dirname(d) for d in dirs} | {os.path.join(home, "Movies")}
+    dirs |= {os.path.join(home, "Desktop"), os.path.join(home, "Downloads")}
+    for root in roots:
+        for dp, dn, _ in os.walk(root):
+            if dp[len(root):].count(os.sep) >= 2:
+                dn[:] = []
+            dirs.add(dp)
+    return sorted(dirs)
+
+
+def relink_missing():
+    """Find clips whose file was moved: same file name and same size, via Spotlight."""
+    found, lost = [], []
+    for c in STATE["clips"]:
+        if os.path.isfile(c["path"]):
+            continue
+        r = subprocess.run(["mdfind", "-name", c["name"]], capture_output=True, text=True)
+        cands = r.stdout.splitlines() + [os.path.join(d, c["name"]) for d in search_dirs()]
+        hit = next((p for p in cands
+                    if os.path.basename(p) == c["name"] and os.path.isfile(p)
+                    and os.path.getsize(p) == c.get("size")), None)
+        if hit:
+            c["path"] = hit
+            found.append(f"{c['name']} → {os.path.dirname(hit)}")
+        else:
+            lost.append(c["name"])
+    save_state()
+    return found, lost
+
+
 def clip_dir(cid):
     return os.path.join(CACHE_DIR, "clips", cid)
 
@@ -422,6 +461,12 @@ def export_worker(job):
         # Each segment carries its output length in frames and `fade`, the number of
         # frames it cross-fades with the previous segment (computed by the UI).
         segs = [s for s in job["segments"] if int(s.get("frames", 0)) >= 1]
+        with LOCK:
+            used = {s[k]["clip"] for s in segs for k in ("a", "b") if s.get(k)}
+            gone = [c["name"] for c in STATE["clips"] if c["id"] in used and not os.path.isfile(c["path"])]
+        if gone:
+            raise RuntimeError("video file(s) not found — moved or renamed? Use “Find moved files”: "
+                               + ", ".join(gone))
         for i, s in enumerate(segs):
             s["frames"] = int(s["frames"])
             s["fade"] = int(s.get("fade", 0)) if i else 0
@@ -568,10 +613,12 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/state":
             with LOCK:
                 return self.send_json({"state": STATE, "analysis": ANALYSIS,
-                                       "projectDir": PROJECT_DIR})
+                                       "projectDir": PROJECT_DIR, "missing": missing_ids()})
         if p == "/api/status":
             ex = {k: v for k, v in EXPORT.items() if k not in ("proc",)}
-            return self.send_json({"analysis": ANALYSIS, "export": ex})
+            with LOCK:
+                miss = missing_ids()
+            return self.send_json({"analysis": ANALYSIS, "export": ex, "missing": miss})
         m = re.fullmatch(r"/api/diffs/([0-9a-f]{12})", p)
         if m:
             return self.send_file(os.path.join(clip_dir(m.group(1)), "diffs.json"), "application/json")
@@ -617,6 +664,10 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 return self.send_json({"added": [c["id"] for c in added], "errors": errors,
                                        "state": STATE, "analysis": ANALYSIS})
+        if p == "/api/relink":
+            with LOCK:
+                found, lost = relink_missing()
+                return self.send_json({"found": found, "lost": lost, "state": STATE, "missing": missing_ids()})
         if p == "/api/remove_clip":
             with LOCK:
                 STATE["clips"] = [c for c in STATE["clips"] if c["id"] != data.get("id")]
