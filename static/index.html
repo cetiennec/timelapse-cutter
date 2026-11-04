@@ -54,6 +54,7 @@
       <button id="playBtn" class="icon play" title="Play / pause (space)">▶</button>
       <button id="nextBtn" class="icon" title="Next kept part">⏭</button>
       <button id="splitBtn2" class="icon" title="Split at playhead (⌘B)">✂</button>
+      <button id="muteBtn" class="icon" title="Music in the preview on / off">🔊</button>
       <div class="timecode"><span id="tcVideo">00:00:00</span><span id="tcReal" class="muted"></span></div>
       <div class="spacer"></div>
       <label class="inline"><input type="checkbox" id="skipCuts" checked> Skip cut parts</label>
@@ -114,6 +115,19 @@
     </details>
 
     <details open>
+      <summary>Music</summary>
+      <div id="musicList" class="mlist"></div>
+      <div class="row wrap"><button id="musicAddBtn" class="btn">＋ Add music…</button></div>
+      <p class="err" id="musicErr"></p>
+      <label>Volume <input type="range" id="musVol" min="0" max="1" step="0.05"><output id="musVolOut"></output></label>
+      <label>Start the music at <input type="range" id="musOffset" min="0" max="60" step="1"><output id="musOffsetOut"></output></label>
+      <label>Fade in <input type="range" id="musFadeIn" min="0" max="10" step="0.5"><output id="musFadeInOut"></output></label>
+      <label>Fade out <input type="range" id="musFadeOut" min="0" max="15" step="0.5"><output id="musFadeOutOut"></output></label>
+      <label class="check"><input type="checkbox" id="musLoop"> Loop when the music is shorter than the video</label>
+      <p class="hint" id="musInfo">Songs play back to back over the exported video. 🔊 under the preview mutes it while you edit.</p>
+    </details>
+
+    <details open>
       <summary>Edit</summary>
       <p class="hint" id="selInfo"></p>
       <div class="row wrap">
@@ -138,6 +152,9 @@
         <button id="hideABtn" class="btn">Hide A here</button>
         <button id="hideBBtn" class="btn">Hide B here</button>
         <button id="unhideBtn" class="btn">Unhide</button>
+      </div>
+      <div class="row wrap">
+        <button id="autoBlurBtn" class="btn" title="Find computer, laptop and phone screens in the selected part (or clip) and blur them there">▭ Blur screens here (auto)</button>
       </div>
     </details>
 

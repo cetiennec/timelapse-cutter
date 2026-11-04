@@ -20,6 +20,8 @@ Run the same command again to continue where you left off.
 
 - **Timeline.** Time is shown both as video time and as real time (1 photo every 2 s at 30 fps, so 1 s of
   video = 1 min of real time; change `settings.interval` in `project.json` if your interval differs).
+  Empty time between recordings (nights, breaks) is squeezed to a thin dark spacer labelled with how long
+  it was, so the timeline only shows footage.
   New clips are placed by the recording time in their metadata, so the two cameras line up. If the camera
   clocks disagree, drag a clip (⌥-drag moves a whole camera track), or use **Align clips** with another
   source (file modified time, date in the file name, back to back).
@@ -55,6 +57,20 @@ Run the same command again to continue where you left off.
   switches to another clip, e.g. a new day, where the camera may have moved a bit; default 12 frames) and
   one *at cuts* and layout changes (default 4 frames). Joins that get a dissolve are marked ◆ on the
   Output row; the preview shows them too. Each dissolve shortens the video by its length.
+- **Blur.** To hide a computer screen (or anything else), click a clip, then **▭ Draw blur area** in the Clip
+  panel and drag a box on the picture (that camera is shown alone while you draw; Esc cancels). Blur
+  areas belong to the clip, since a camera may sit differently each day; **Copy to same day** / **Copy to
+  all A/B** puts the same areas on the camera's other clips. Remove one with its ✕ chip. The preview and the
+  export both blur them.
+  **▭ Blur screens here (auto)** in the Edit panel finds computer, laptop and phone screens in the selected
+  part (or the selected clip) on both cameras and blurs them for that part only (chips marked *auto*).
+  It samples a few frames per clip with an open-vocabulary detector (OWLv2) and keeps what is found in
+  most of them. Needs `python3 -m pip install torch transformers`; the model (~600 MB) downloads on first use.
+- **Music.** **＋ Add music…** in the Music panel picks songs (mp3, m4a, wav, flac…); they play back to
+  back over the exported video, in list order (↑ to reorder), from *Start the music at* into the first song,
+  looped if shorter than the video (or silent after, if *Loop* is off), with a volume and a fade in / fade
+  out at the video's ends. The preview plays it in time with the output; 🔊 under the preview mutes it.
+  The export copies the video and adds the music as AAC.
 - **Export.** Each kept piece is rendered with ffmpeg at the chosen resolution and joined without
   re-encoding. Options: resolution (incl. 4K, wide, vertical), x264 (quality) or Apple hardware (fast)
   encoder, and a speed-up factor.

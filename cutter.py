@@ -34,6 +34,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts"}
+AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".aif", ".aiff", ".flac", ".ogg", ".opus", ".caf"}
 
 # Analysis frames are downscaled to this size; thumbnails every THUMB_EVERY frames.
 AN_W, AN_H = 64, 36
@@ -67,6 +68,12 @@ def default_state():
         "detect": {"auto": True, "sensitivity": 2.5, "minStillMin": 3.0, "padSec": 20.0},
         "transitions": {"session": 12, "cut": 4},
         "output": {"width": 1920, "height": 1080, "encoder": "x264", "speed": 1.0},
+        # Soundtrack: songs played back to back from `offset` s into the first one,
+        # looped if shorter than the video, faded in/out at the video's ends.
+        "music": {"tracks": [], "volume": 0.8, "fadeIn": 1.0, "fadeOut": 3.0, "offset": 0.0, "loop": True},
+        # Blurred areas (e.g. a computer screen), per clip: {clip id: [{x, y, w, h}]} as
+        # fractions of the source frame.
+        "blurs": {},
     }
 
 
@@ -257,6 +264,170 @@ def add_clips(track, paths):
     return added, errors
 
 
+def add_music(paths):
+    added, errors = [], []
+    for p in paths:
+        p = os.path.abspath(os.path.expanduser(p.strip()))
+        if os.path.splitext(p)[1].lower() not in AUDIO_EXT:
+            errors.append(f"{os.path.basename(p)}: not an audio file")
+            continue
+        r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", p],
+                           capture_output=True, text=True)
+        try:
+            dur = float(json.loads(r.stdout)["format"]["duration"])
+        except Exception:
+            errors.append(f"{os.path.basename(p)}: can't read it")
+            continue
+        st = os.stat(p)
+        mid = hashlib.sha1(f"{p}|{st.st_size}|{st.st_mtime}".encode()).hexdigest()[:12]
+        with LOCK:
+            if any(t["id"] == mid for t in STATE["music"]["tracks"]):
+                continue
+            t = {"id": mid, "path": p, "name": os.path.basename(p), "duration": dur}
+            STATE["music"]["tracks"].append(t)
+            added.append(t)
+    with LOCK:
+        save_state()
+    return added, errors
+
+
+def music_missing():
+    return [t["id"] for t in STATE["music"]["tracks"] if not os.path.isfile(t["path"])]
+
+
+def mux_music(video, out, music):
+    """Lay the soundtrack under `video` (copied as is) and write `out`."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video],
+                       capture_output=True, text=True)
+    dur = float(r.stdout.strip())
+    tracks = music["tracks"]
+    total = sum(t["duration"] for t in tracks)
+    offset = min(max(0.0, float(music.get("offset", 0))), max(0.0, total - 0.1))
+    reps = max(1, int(-(-(offset + dur) // total))) if music.get("loop", True) else 1
+    seq = (tracks * reps)[:200]
+    inputs, chain = [], []
+    for i, t in enumerate(seq):
+        inputs += ["-i", t["path"]]
+        chain.append(f"[{i + 1}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[m{i}]")
+    fi, fo = max(0.0, float(music.get("fadeIn", 0))), max(0.0, float(music.get("fadeOut", 0)))
+    vol = max(0.0, float(music.get("volume", 0.8)))
+    a = "".join(f"[m{i}]" for i in range(len(seq)))
+    post = f"atrim=start={offset:.3f}:duration={dur:.3f},asetpts=PTS-STARTPTS,volume={vol:.3f}"
+    if fi:
+        post += f",afade=t=in:st=0:d={min(fi, dur):.3f}"
+    if fo:
+        post += f",afade=t=out:st={max(0.0, dur - fo):.3f}:d={min(fo, dur):.3f}"
+    chain.append(f"{a}concat=n={len(seq)}:v=0:a=1,{post},apad[aout]")
+    run_ffmpeg(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", video, *inputs,
+                "-filter_complex", ";".join(chain), "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{dur:.3f}",
+                "-movflags", "+faststart", out], "music")
+
+
+# ---------------------------------------------------------------- screen detection
+
+SCREEN = {"model": None, "lock": threading.Lock()}
+SCREEN_MODEL = "google/owlv2-base-patch16-ensemble"
+SCREEN_QUERIES = ["a computer monitor", "a laptop screen", "a television screen", "a phone screen"]
+
+
+def screen_model():
+    """Open-vocabulary detector (OWLv2), loaded on first use (downloads ~600 MB once)."""
+    if SCREEN["model"] is None:
+        try:
+            import torch
+            from transformers import Owlv2ForObjectDetection, Owlv2Processor
+        except ImportError:
+            raise RuntimeError("screen detection needs PyTorch and transformers: "
+                               "python3 -m pip install torch transformers")
+        dev = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+        proc = Owlv2Processor.from_pretrained(SCREEN_MODEL)
+        model = Owlv2ForObjectDetection.from_pretrained(SCREEN_MODEL).to(dev).eval()
+        SCREEN["model"] = (torch, proc, model, dev)
+    return SCREEN["model"]
+
+
+def grab_frame(path, t):
+    from PIL import Image
+    import io
+    r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-ss", f"{max(0, t):.3f}", "-i", path,
+                        "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"], capture_output=True)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    return Image.open(io.BytesIO(r.stdout)).convert("RGB")
+
+
+def detect_screens(clip, t0, t1, threshold=0.3):
+    """Screens visible in clip between t0 and t1 (clip seconds), as boxes in fractions of
+    the frame. Samples a few frames and keeps what shows up in most of them: screens
+    don't move while the camera stands still, stray detections do."""
+    n = int(min(12, max(3, (t1 - t0) // 20 + 1)))
+    times = [t0 + (t1 - t0) * (i + 0.5) / n for i in range(n)]
+    with SCREEN["lock"]:
+        torch, proc, model, dev = screen_model()
+        dets, seen, size = [], 0, None
+        for k, t in enumerate(times):
+            im = grab_frame(clip["path"], t)
+            if im is None:
+                continue
+            seen += 1
+            size = im.size
+            inp = proc(text=[SCREEN_QUERIES], images=im, return_tensors="pt").to(dev)
+            with torch.no_grad():
+                out = model(**inp)
+            side = max(im.size)   # OWLv2 pads the image to a square
+            res = proc.post_process_grounded_object_detection(out, threshold=threshold,
+                                                              target_sizes=torch.tensor([[side, side]]))[0]
+            for sc, lb, bx in zip(res["scores"].tolist(), res["labels"].tolist(), res["boxes"].tolist()):
+                dets.append((k, sc, SCREEN_QUERIES[lb], bx))
+    if not seen:
+        raise RuntimeError("could not read frames from the video")
+    W, H = size
+
+    def overlap(a, b):
+        ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+        iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+        inter = ix * iy
+        area = lambda r: max(1e-6, (r[2] - r[0]) * (r[3] - r[1]))
+        return max(inter / (area(a) + area(b) - inter), inter / min(area(a), area(b)) * 0.5)
+
+    def union(a, b):
+        return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+
+    clusters = []   # {box, frames, score, label}
+    for k, sc, lb, bx in sorted(dets, key=lambda d: -d[1]):
+        c = next((c for c in clusters if overlap(c["box"], bx) > 0.3), None)
+        if c:
+            c["box"] = union(c["box"], bx); c["frames"].add(k)
+        else:
+            clusters.append({"box": list(bx), "frames": {k}, "score": sc, "label": lb})
+    need = max(1, -(-seen * 3 // 10))   # in at least 30% of the frames
+    keep = [c for c in clusters if len(c["frames"]) >= need]
+    merged = True
+    while merged:   # boxes that ended up overlapping become one
+        merged = False
+        for i in range(len(keep)):
+            for j in range(i + 1, len(keep)):
+                if overlap(keep[i]["box"], keep[j]["box"]) > 0.3:
+                    keep[i]["box"] = union(keep[i]["box"], keep[j]["box"])
+                    keep[i]["score"] = max(keep[i]["score"], keep[j]["score"])
+                    del keep[j]; merged = True
+                    break
+            if merged:
+                break
+    boxes = []
+    for c in keep:
+        x0, y0, x1, y1 = c["box"]
+        px, py = 0.02 * W, 0.02 * H   # a little margin around the screen
+        x0, y0 = max(0.0, x0 - px), max(0.0, y0 - py)
+        x1, y1 = min(W, x1 + px), min(H, y1 + py)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+        boxes.append({"x": x0 / W, "y": y0 / H, "w": (x1 - x0) / W, "h": (y1 - y0) / H,
+                      "score": round(c["score"], 2), "label": c["label"]})
+    return {"boxes": boxes, "frames": seen}
+
+
 # ---------------------------------------------------------------- analysis
 
 def queue_analysis(cid):
@@ -353,8 +524,26 @@ def fit(inp, w, h, fill, out, fps, speed):
     return f"[{inp}]setpts=(PTS-STARTPTS)/{speed},fps={fps},{f},setsar=1,format=yuv420p[{out}]"
 
 
-def segment_filter(seg, lay, W, H, fps, speed):
-    """Build a filter graph for one segment. Inputs: 0 = A (if present), next = B."""
+def blur_filter(src, boxes, sigma, out):
+    """Blur each box (fractions of the frame) of input `src` into label `out`."""
+    parts, cur = [], src
+    for j, b in enumerate(boxes):
+        x, y, w, h = (min(1.0, max(0.0, float(b[k]))) for k in ("x", "y", "w", "h"))
+        if w < 0.002 or h < 0.002:
+            continue
+        p = f"{out}_{j}"
+        parts.append(f"[{cur}]split=2[{p}m][{p}c];"
+                     f"[{p}c]crop=w=iw*{w:.5f}:h=ih*{h:.5f}:x=iw*{x:.5f}:y=ih*{y:.5f},gblur=sigma={sigma:.1f}[{p}b];"
+                     f"[{p}m][{p}b]overlay=x=W*{x:.5f}:y=H*{y:.5f}[{p}o]")
+        cur = f"{p}o"
+    if not parts:
+        return None
+    return ";".join(parts) + f";[{cur}]null[{out}]"
+
+
+def segment_filter(seg, lay, W, H, fps, speed, blurs=None):
+    """Build a filter graph for one segment. Inputs: 0 = A (if present), next = B.
+    `blurs` maps "A"/"B" to (boxes, sigma) for the areas to blur in that source."""
     srcs = []
     if seg.get("a"):
         srcs.append("A")
@@ -365,6 +554,17 @@ def segment_filter(seg, lay, W, H, fps, speed):
     mode = lay.get("mode", "pip")
     if mode in ("A", "B") and mode in idx:
         srcs = [mode]
+    pre = []
+    for s_ in srcs:
+        if blurs and blurs.get(s_):
+            f = blur_filter(idx[s_], *blurs[s_], f"blur{s_}")
+            if f:
+                pre.append(f)
+                idx[s_] = f"blur{s_}"
+    return ";".join(pre + [layout_filter(srcs, idx, lay, W, H, fps, speed, fill, mode)])
+
+
+def layout_filter(srcs, idx, lay, W, H, fps, speed, fill, mode):
     if len(srcs) == 1:
         return fit(idx[srcs[0]], W, H, fill, "out", fps, speed)
     if mode == "sbs":
@@ -422,17 +622,23 @@ def render_segment(seg, first, nframes, out, ctx, enc):
     fps, speed = ctx["fps"], ctx["speed"]
     skip = first * speed / fps
     cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y"]
+    blurs = {}
     for key in ("a", "b"):
         s = seg.get(key)
         if s:
             with LOCK:
                 clip = clip_by_id(s["clip"])
+                boxes = list(STATE.get("blurs", {}).get(s["clip"], []))
             if not clip:
                 raise RuntimeError(f"unknown clip {s['clip']}")
+            if "blur" in seg:   # the UI sends the boxes active in this segment
+                boxes = list((seg["blur"] or {}).get(key) or [])
+            if boxes:
+                blurs[key.upper()] = (boxes, max(6.0, 0.02 * min(clip["width"] or 1080, clip["height"] or 1080)))
             cmd += ["-ss", f"{max(0, s['t'] + skip):.4f}", "-t", f"{(nframes + 2) * speed / fps:.4f}",
                     "-i", clip["path"]]
     lay = seg.get("layout") or ctx["layout"]   # per-part layout overrides come with the segment
-    cmd += ["-filter_complex", segment_filter(seg, lay, ctx["W"], ctx["H"], fps, speed),
+    cmd += ["-filter_complex", segment_filter(seg, lay, ctx["W"], ctx["H"], fps, speed, blurs),
             "-map", "[out]", "-frames:v", str(nframes), "-r", f"{fps:g}", "-an",
             *enc, "-pix_fmt", "yuv420p", "-video_track_timescale", "30000", out]
     run_ffmpeg(cmd, "segment")
@@ -467,6 +673,12 @@ def export_worker(job):
         if gone:
             raise RuntimeError("video file(s) not found — moved or renamed? Use “Find moved files”: "
                                + ", ".join(gone))
+        with LOCK:
+            music = json.loads(json.dumps(STATE["music"]))
+        lost = [t["name"] for t in music["tracks"] if not os.path.isfile(t["path"])]
+        if lost:
+            raise RuntimeError("music file(s) not found — moved or renamed? Remove and add them again: "
+                               + ", ".join(lost))
         for i, s in enumerate(segs):
             s["frames"] = int(s["frames"])
             s["fade"] = int(s.get("fade", 0)) if i else 0
@@ -500,11 +712,15 @@ def export_worker(job):
             f.writelines(f"file '{p}'\n" for p in parts)
         EXPORT["step"] = "joining"
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        joined = os.path.join(tmp, "joined.mp4") if music["tracks"] else path
         r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0",
-                            "-i", lst, "-c", "copy", "-movflags", "+faststart", path],
+                            "-i", lst, "-c", "copy", "-movflags", "+faststart", joined],
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip()[-800:])
+        if music["tracks"]:
+            EXPORT["step"] = "adding music"
+            mux_music(joined, path, music)
         shutil.rmtree(tmp, ignore_errors=True)
         EXPORT.update(running=False, progress=1.0, step="done", output=path)
     except Exception as e:
@@ -514,9 +730,10 @@ def export_worker(job):
 
 # ---------------------------------------------------------------- macOS helpers
 
-def pick_files():
-    script = '''
-set fs to choose file with prompt "Choose timelapse videos" with multiple selections allowed
+def pick_files(prompt="Choose timelapse videos", types=None):
+    of_type = f' of type {{"{types}"}}' if types else ""
+    script = f'''
+set fs to choose file with prompt "{prompt}"{of_type} with multiple selections allowed
 set out to ""
 repeat with f in fs
   set out to out & POSIX path of f & linefeed
@@ -612,8 +829,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(f)
         if p == "/api/state":
             with LOCK:
-                return self.send_json({"state": STATE, "analysis": ANALYSIS,
-                                       "projectDir": PROJECT_DIR, "missing": missing_ids()})
+                return self.send_json({"state": STATE, "analysis": ANALYSIS, "projectDir": PROJECT_DIR,
+                                       "missing": missing_ids(), "musicMissing": music_missing()})
         if p == "/api/status":
             ex = {k: v for k, v in EXPORT.items() if k not in ("proc",)}
             with LOCK:
@@ -631,6 +848,13 @@ class Handler(BaseHTTPRequestHandler):
             ext = os.path.splitext(clip["path"])[1].lower()
             ctype = "video/webm" if ext == ".webm" else "video/mp4"
             return self.send_file(clip["path"], ctype)
+        m = re.fullmatch(r"/audio/([0-9a-f]{12})", p)
+        if m:
+            with LOCK:
+                t = next((t for t in STATE["music"]["tracks"] if t["id"] == m.group(1)), None)
+            if not t:
+                return self.send_error(404)
+            return self.send_file(t["path"])
         m = re.fullmatch(r"/thumb/([0-9a-f]{12})/(\d+)\.jpg", p)
         if m:
             f = os.path.join(clip_dir(m.group(1)), "thumbs", f"{int(m.group(2)):06d}.jpg")
@@ -645,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "bad json"}, 400)
         if p == "/api/state":
             with LOCK:
-                for k in ("cuts", "keeps", "splits", "overrides", "hidden", "layout", "detect", "transitions", "output", "settings", "tracks"):
+                for k in ("cuts", "keeps", "splits", "overrides", "hidden", "layout", "detect", "transitions", "output", "settings", "tracks", "music", "blurs"):
                     if k in data:
                         STATE[k] = data[k]
                 if "clips" in data:
@@ -664,6 +888,26 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 return self.send_json({"added": [c["id"] for c in added], "errors": errors,
                                        "state": STATE, "analysis": ANALYSIS})
+        if p in ("/api/music/add", "/api/music/pick"):
+            paths = pick_files("Choose music", "public.audio") if p == "/api/music/pick" else data.get("paths", [])
+            added, errors = add_music(paths)
+            with LOCK:
+                return self.send_json({"added": [t["id"] for t in added], "errors": errors,
+                                       "music": STATE["music"], "musicMissing": music_missing()})
+        if p == "/api/detect_screens":
+            with LOCK:
+                clip = clip_by_id(data.get("clip", ""))
+            if not clip:
+                return self.send_json({"error": "unknown clip"}, 404)
+            if not os.path.isfile(clip["path"]):
+                return self.send_json({"error": f"file missing: {clip['name']}"}, 404)
+            t0 = max(0.0, float(data.get("t0", 0)))
+            t1 = min(clip["duration"], float(data.get("t1", clip["duration"])))
+            try:
+                return self.send_json(detect_screens(clip, t0, max(t0, t1)))
+            except Exception as e:
+                traceback.print_exc()
+                return self.send_json({"error": str(e)}, 500)
         if p == "/api/relink":
             with LOCK:
                 found, lost = relink_missing()

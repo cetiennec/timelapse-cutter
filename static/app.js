@@ -10,6 +10,7 @@ let S = null;            // project state (mirrors project.json)
 let AN = {};             // analysis status per clip id
 let PROJECT_DIR = '';
 let MISSING = new Set();  // clip ids whose video file is not where the project expects it
+let MUSIC_MISSING = new Set();
 const DIFFS = {};        // clip id -> { smooth: Float32Array, thumbEvery, nThumbs }
 const THUMBS = new Map();
 let THR = { A: 1, B: 1 };
@@ -112,6 +113,11 @@ function scheduleDetect() {
   detectTimer = setTimeout(() => detectStill(false), 150);
 }
 
+// Blur areas belong to a clip; detected ones only apply between start and end (master time).
+const blurOn = (b, t) => b.start == null || (t >= b.start && t < b.end);
+const blursAt = (c, t) => (c && (S.blurs || {})[c.id] || []).filter((b) => blurOn(b, t));
+const boxOnly = ({ x, y, w, h }) => ({ x, y, w, h });
+
 // Kept parts of the master timeline, split wherever the visible clips change.
 function segments() {
   if (segCache) return segCache;
@@ -128,6 +134,7 @@ function segments() {
   for (const c of S.clips) { bps.add(c.start); bps.add(clipEnd(c)); }
   for (const tr of TRACKS) for (const h of S.hidden[tr] || []) { bps.add(h.start); bps.add(h.end); }
   for (const o of S.overrides) { bps.add(o.start); bps.add(o.end); }
+  for (const bs of Object.values(S.blurs || {})) for (const b of bs) if (b.start != null) { bps.add(b.start); bps.add(b.end); }
   const sorted = [...bps].sort((a, b) => a - b);
   const segs = [];
   const minDur = 0.5 / fps();
@@ -144,6 +151,7 @@ function segments() {
         a: ca ? { clip: ca.id, t: s0 - ca.start } : null,
         b: cb ? { clip: cb.id, t: s0 - cb.start } : null,
         layout: layoutAt(m),
+        blur: { a: blursAt(ca, m).map(boxOnly), b: blursAt(cb, m).map(boxOnly) },
       });
     }
   }
@@ -173,6 +181,7 @@ function updateStats() {
   const total = timelineEnd();
   $('#forgetKeepsBtn').hidden = !S.keeps.length;
   renderTransitions();
+  if (S.music) renderMusic();
   $('#stats').innerHTML = S.clips.length
     ? `Timeline <b>${fmtDur(total)}</b> (${fmtReal(total)} real) → output <b>${fmtDur(outputSeconds())}</b>
        · cut ${total ? Math.round(100 * (1 - kept / total)) : 0}%`
@@ -183,15 +192,16 @@ function updateStats() {
 
 const snapshot = () => JSON.stringify({
   clips: S.clips.map((c) => [c.id, c.start, c.track]), cuts: S.cuts, keeps: S.keeps, hidden: S.hidden,
-  splits: S.splits, overrides: S.overrides,
+  splits: S.splits, overrides: S.overrides, blurs: S.blurs,
 });
 function restore(snap) {
   const o = JSON.parse(snap);
   const m = new Map(o.clips.map(([id, start, track]) => [id, { start, track }]));
   for (const c of S.clips) if (m.has(c.id)) Object.assign(c, m.get(c.id));
   S.cuts = o.cuts; S.keeps = o.keeps || []; S.hidden = o.hidden;
-  S.splits = o.splits || []; S.overrides = o.overrides || [];
+  S.splits = o.splits || []; S.overrides = o.overrides || []; S.blurs = o.blurs || {};
   ui.selCut = -1;
+  if (ui.selClip) renderClipInfo();
   changed(false);
 }
 function pushUndo(snap = snapshot()) {
@@ -211,7 +221,7 @@ function scheduleSave() {
       clips: S.clips.map((c) => ({ id: c.id, start: c.start, track: c.track })),
       cuts: S.cuts, keeps: S.keeps, hidden: S.hidden, layout: S.layout, detect: S.detect,
       transitions: S.transitions, splits: S.splits, overrides: S.overrides,
-      output: S.output, settings: S.settings, tracks: S.tracks,
+      output: S.output, settings: S.settings, tracks: S.tracks, music: S.music, blurs: S.blurs,
     });
     $('#saveState').textContent = 'Saved';
   }, 500);
@@ -328,12 +338,53 @@ function fitStage() {
 function place(v, x, y, w, h, z, opacity = 1, fit = 'contain', border = 0) {
   Object.assign(v.style, {
     display: 'block', left: `${x * 100}%`, top: `${y * 100}%`, width: `${w * 100}%`, height: `${h * 100}%`,
-    zIndex: z, opacity, objectFit: fit, outline: border ? `${border}px solid #fff` : 'none',
+    zIndex: 2 * z, opacity, objectFit: fit, outline: border ? `${border}px solid #fff` : 'none',
   });
+}
+
+// Where the picture of clip c is drawn inside video element v (object-fit), in stage pixels.
+function pictureRect(v, c) {
+  const ew = v.offsetWidth, eh = v.offsetHeight, sw = c.width || 16, sh = c.height || 9;
+  const k = (v.style.objectFit === 'cover' ? Math.max : Math.min)(ew / sw, eh / sh);
+  const w = sw * k, h = sh * k;
+  return { x: v.offsetLeft + (ew - w) / 2, y: v.offsetTop + (eh - h) / 2, w, h,
+    clip: { x: v.offsetLeft, y: v.offsetTop, w: ew, h: eh } };
+}
+// A blur box (fractions of the source frame) in stage pixels, cut to the video element.
+function boxRect(pr, b) {
+  const x0 = Math.max(pr.clip.x, pr.x + b.x * pr.w), y0 = Math.max(pr.clip.y, pr.y + b.y * pr.h);
+  const x1 = Math.min(pr.clip.x + pr.clip.w, pr.x + (b.x + b.w) * pr.w);
+  const y1 = Math.min(pr.clip.y + pr.clip.h, pr.y + (b.y + b.h) * pr.h);
+  return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+}
+const blurEls = [];
+function layoutBlurs(ca, cb) {
+  let n = 0;
+  const box = (r, z, radius, cls) => {
+    let el = blurEls[n];
+    if (!el) { el = document.createElement('div'); $('#stage').appendChild(el); blurEls.push(el); }
+    n++;
+    el.className = cls;
+    Object.assign(el.style, { display: 'block', left: `${r.x}px`, top: `${r.y}px`, width: `${r.w}px`, height: `${r.h}px`,
+      zIndex: z, backdropFilter: radius ? `blur(${radius}px)` : 'none', webkitBackdropFilter: radius ? `blur(${radius}px)` : 'none' });
+  };
+  for (const [tr, c] of [['A', ca], ['B', cb]]) {
+    const v = vids[tr];
+    if (!c || v.style.display !== 'block') continue;
+    const pr = pictureRect(v, c), z = (parseInt(v.style.zIndex, 10) || 0) + 1;
+    const radius = Math.max(2, 0.02 * pr.h);
+    const mark = c.id === ui.selClip ? ' sel' : '';
+    for (const b of blursAt(c, ui.t)) { const r = boxRect(pr, b); if (r) box(r, z, radius, `stage-blur${mark}`); }
+    const d = ui.blurDraw;
+    if (d && d.clip === c.id && d.box) { const r = boxRect(pr, d.box); if (r) box(r, z, radius, 'stage-blur drawing'); }
+  }
+  for (let i = n; i < blurEls.length; i++) blurEls[i].style.display = 'none';
 }
 
 function layoutStage(ca, cb) {
   layoutVideos(ca, cb);
+  layoutBlurs(ca, cb);
+  $('#stage').classList.toggle('drawing', !!ui.blurDraw);
   for (const [tr, c] of [['A', ca], ['B', cb]]) {
     const m = $(`#msg${tr}`), v = vids[tr];
     const show = c && MISSING.has(c.id) && v.style.display === 'block';
@@ -350,6 +401,7 @@ function layoutVideos(ca, cb) {
   const fit = L.fill ? 'cover' : 'contain';
   let show = [ca && 'A', cb && 'B'].filter(Boolean);
   if ((L.mode === 'A' || L.mode === 'B') && show.includes(L.mode)) show = [L.mode];
+  if (ui.blurDraw && show.includes(ui.blurDraw.track)) show = [ui.blurDraw.track];   // drawing a blur box
   for (const tr of TRACKS) if (!show.includes(tr)) vids[tr].style.display = 'none';
   if (show.length === 1) return place(vids[show[0]], 0, 0, 1, 1, 1, 1, fit);
   if (show.length === 0) return;
@@ -450,7 +502,7 @@ function tick(now) {
       if (p >= 1) stopFade(); else fadeCv.style.opacity = 1 - p;
     }
     const ca = coverage('A', ui.t), cb = coverage('B', ui.t);
-    syncVideo('A', ca); syncVideo('B', cb);
+    syncVideo('A', ca); syncVideo('B', cb); syncMusic();
     layoutStage(ca, cb);
     $('#stageEmpty').style.display = S.clips.length ? 'none' : 'flex';
     $('#stageCut').style.display = rangeAt(S.cuts, ui.t) >= 0 ? 'block' : 'none';
@@ -482,6 +534,17 @@ function startFade(dur, hold = false) {
     g.globalAlpha = parseFloat(v.style.opacity || '1');
     g.drawImage(v, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
     g.restore();
+    const c = S.clips.find((cl) => cl.id === v._clip);
+    for (const b of blursAt(c, ui.t)) {
+      const pr = pictureRect(v, c), r = boxRect(pr, b);
+      if (!r) continue;
+      g.save();
+      g.beginPath(); g.rect(r.x, r.y, r.w, r.h); g.clip();
+      g.globalAlpha = parseFloat(v.style.opacity || '1');
+      g.filter = `blur(${Math.max(2, 0.02 * pr.h)}px)`;
+      g.drawImage(v, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+      g.restore();
+    }
     const b = parseFloat(v.style.outlineWidth) || 0;
     if (v.style.outlineStyle === 'solid' && b) {
       g.strokeStyle = '#fff'; g.lineWidth = b; g.strokeRect(x - b / 2, y - b / 2, w + b, h + b);
@@ -503,6 +566,52 @@ function segIndexAt(t) {
   }
   return -1;
 }
+// Output time (seconds into the exported video) at master time t, or null in a cut.
+let outCache = null, outCacheFor = null;
+function outAt(t) {
+  const segs = segments();
+  if (outCacheFor !== segs) {
+    let acc = 0;
+    outCache = segs.map((sg) => { acc -= sg.fade; const o = acc; acc += sg.frames; return o; });
+    outCacheFor = segs;
+  }
+  const i = segIndexAt(t);
+  if (i < 0) return null;
+  return (outCache[i] + ((t - segs[i].start) * fps()) / (S.output.speed || 1)) / fps();
+}
+
+// Soundtrack: which song plays at output time o, and how loud (same rules as the export).
+const mus = new Audio();
+mus.preload = 'auto';
+function musicAt(o) {
+  const M = S.music, total = M.tracks.reduce((n, t) => n + t.duration, 0);
+  if (!total) return null;
+  let x = o + (M.offset || 0);
+  if (M.loop) x %= total; else if (x >= total) return null;
+  for (const t of M.tracks) { if (x < t.duration) return { track: t, t: x }; x -= t.duration; }
+  return null;
+}
+function musicGain(o) {
+  const M = S.music, D = outputSeconds();
+  let g = M.volume;
+  if (M.fadeIn > 0 && o < M.fadeIn) g *= o / M.fadeIn;
+  if (M.fadeOut > 0 && o > D - M.fadeOut) g *= Math.max(0, (D - o) / M.fadeOut);
+  return clamp(g, 0, 1);
+}
+function syncMusic() {
+  const o = ui.playing && !ui.muted ? outAt(ui.t) : null;
+  const m = o == null ? null : musicAt(o);
+  if (!m || MUSIC_MISSING.has(m.track.id)) { if (!mus.paused) mus.pause(); return; }
+  if (mus._id !== m.track.id) { mus._id = m.track.id; mus.src = `/audio/${m.track.id}`; mus.currentTime = m.t; }
+  // The preview shows dissolves without overlapping the pieces, so it drifts a little
+  // from the export's timing: nudge the rate, jump only when far off.
+  const drift = mus.currentTime - m.t;
+  if (Math.abs(drift) > 1 || (mus.paused && Math.abs(drift) > 0.1)) mus.currentTime = m.t;
+  mus.playbackRate = ui.speed * clamp(1 - drift * 0.5, 0.9, 1.1);
+  mus.volume = musicGain(o);
+  if (mus.paused) mus.play().catch(() => {});
+}
+
 function maybeDissolve(t0, t1) {
   const i1 = segIndexAt(t1);
   if (i1 <= 0 || i1 === segIndexAt(t0)) return;
@@ -547,40 +656,57 @@ const trackY = (i) => RULER + 6 + i * (TRACK_H + GAP);
 const OUT_Y = () => trackY(2) + 2;
 let drawDirty = true;
 
-// "View" coordinates: master time, or in collapsed mode the time with every
-// part that is not exported (cuts, gaps) squeezed out.
+// "View" coordinates: master time with the empty time between recordings (nights,
+// breaks) squeezed to a short spacer, or in collapsed mode with every part that is
+// not exported (cuts, gaps) squeezed out. Each interval maps [a, b] to [off, off + b - a];
+// time in a gap maps linearly onto the spacer before the next interval.
 let viewMap = null;
 function keptIntervals() {
   if (viewMap) return viewMap;
   const out = [];
-  for (const sg of segments()) {
-    const last = out[out.length - 1];
-    if (last && Math.abs(last.b - sg.start) < 1e-6) last.b = sg.end;
-    else out.push({ a: sg.start, b: sg.end });
+  if (ui.compact) {
+    for (const sg of segments()) {
+      const last = out[out.length - 1];
+      if (last && Math.abs(last.b - sg.start) < 1e-6) last.b = sg.end;
+      else out.push({ a: sg.start, b: sg.end });
+    }
+  } else {
+    for (const r of mergeRanges(S.clips.map((c) => ({ start: c.start, end: clipEnd(c) })))) out.push({ a: r.start, b: r.end });
   }
+  const total = out.reduce((n, k) => n + k.b - k.a, 0);
+  const spacer = ui.compact ? 0 : Math.max(0.5, total * 0.006);
   let off = 0;
-  for (const k of out) { k.off = off; off += k.b - k.a; }
+  for (const [i, k] of out.entries()) {
+    if (i || k.a > 0) off += spacer;
+    k.off = off; off += k.b - k.a;
+  }
+  out.spacer = spacer;
   return (viewMap = out);
 }
 function vOf(t) {
-  if (!ui.compact) return t;
   const ks = keptIntervals();
+  if (!ks.length) return t;
+  let pb = 0, pv = 0;
   for (const k of ks) {
-    if (t < k.a) return k.off;
+    if (t < k.a) return k.a > pb ? pv + (k.off - pv) * (t - pb) / (k.a - pb) : k.off;
     if (t <= k.b) return k.off + (t - k.a);
+    pb = k.b; pv = k.off + (k.b - k.a);
   }
-  return viewEnd();
+  return pv;
 }
 function tOfV(v) {
-  if (!ui.compact) return v;
   const ks = keptIntervals();
-  if (!ks.length) return 0;
-  if (v <= 0) return ks[0].a;
-  for (const k of ks) if (v < k.off + (k.b - k.a)) return k.a + (v - k.off);
-  return ks[ks.length - 1].b;
+  if (!ks.length) return v;
+  let pb = 0, pv = 0;
+  for (const k of ks) {
+    if (v < k.off) return k.off > pv ? pb + (k.a - pb) * Math.max(0, v - pv) / (k.off - pv) : k.a;
+    if (v < k.off + (k.b - k.a)) return k.a + (v - k.off);
+    pb = k.b; pv = k.off + (k.b - k.a);
+  }
+  return pb;
 }
+const inSpacer = (v) => keptIntervals().some((k, i, ks) => v < k.off && v >= (i ? ks[i - 1].off + ks[i - 1].b - ks[i - 1].a : 0));
 function viewEnd() {
-  if (!ui.compact) return timelineEnd();
   const ks = keptIntervals();
   return ks.length ? ks[ks.length - 1].off + ks[ks.length - 1].b - ks[ks.length - 1].a : 1;
 }
@@ -712,6 +838,7 @@ function drawBase() {
 
   // cuts across all tracks
   const yTop = trackY(0), yBot = trackY(1) + TRACK_H;
+
   S.cuts.forEach((c, i) => {
     const x0 = Math.max(LABEL_W, xOf(c.start)), x1 = Math.min(W, xOf(c.end));
     if (ui.compact) {
@@ -731,6 +858,25 @@ function drawBase() {
     if (sel) { g.strokeStyle = '#ff4d5e'; g.lineWidth = 2; g.strokeRect(x0 + 1, yTop + 1, x1 - x0 - 2, yBot - yTop - 2); }
   });
 
+  // empty time between recordings, squeezed to a spacer: show how long it was
+  if (!ui.compact) {
+    let pb = 0, pv = 0;
+    for (const k of keptIntervals()) {
+      const x0 = Math.max(LABEL_W, LABEL_W + (pv - ui.view.start) * ui.view.pps);
+      const x1 = Math.min(W, LABEL_W + (k.off - ui.view.start) * ui.view.pps);
+      if (x1 > x0 && k.a > pb) {
+        g.fillStyle = '#121316'; g.fillRect(x0, yTop - 4, x1 - x0, OUT_Y() + OUT_H - yTop + 4);
+        g.strokeStyle = '#3a3e45'; g.lineWidth = 1; g.setLineDash([2, 3]);
+        g.beginPath(); const xm = Math.round((x0 + x1) / 2) + 0.5; g.moveTo(xm, yTop); g.lineTo(xm, yBot); g.stroke(); g.setLineDash([]);
+        const label = fmtReal(k.a - pb);
+        g.font = '10px -apple-system';
+        if (x1 - x0 > g.measureText(label).width + 6) {
+          g.fillStyle = '#6b7078'; g.fillText(label, (x0 + x1) / 2 - g.measureText(label).width / 2, yTop + 10);
+        }
+      }
+      pb = k.b; pv = k.off + (k.b - k.a);
+    }
+  }
   // split points and the selected piece
   for (const sp of S.splits) {
     const x = Math.round(xOf(sp)) + 0.5;
@@ -768,9 +914,9 @@ function drawBase() {
   const v0 = ui.view.start, v1 = ui.view.start + (W - LABEL_W) / ui.view.pps;
   for (let v = Math.floor(Math.max(0, v0) / step) * step; v <= v1; v += step) {
     const x = Math.round(LABEL_W + (v - v0) * ui.view.pps) + 0.5;
-    if (x < LABEL_W) continue;
+    if (x < LABEL_W || (!ui.compact && inSpacer(v))) continue;
     g.moveTo(x, RULER - 12); g.lineTo(x, RULER - 5);
-    g.fillText(fmtVideo(v), x + 3, 11);
+    g.fillText(fmtVideo(ui.compact ? v : tOfV(v)), x + 3, 11);
     g.fillText(fmtReal(tOfV(v)), x + 3, 22);
   }
   g.stroke();
@@ -1010,10 +1156,17 @@ canvas.addEventListener('wheel', (e) => {
 // ------------------------------------------------------------------ edit actions
 
 // Pieces: split points (⌘B) divide the timeline; clicking a clip selects the piece under it.
+// A piece never extends past a stretch with footage (e.g. into the next day): without a
+// split there, deleting it would silently remove everything up to the next split.
 const pieceBounds = () => [0, ...S.splits.filter((x) => x > 0 && x < timelineEnd()), timelineEnd()];
 function pieceAt(t) {
   const b = pieceBounds();
-  for (let i = 0; i < b.length - 1; i++) if (t >= b[i] && t < b[i + 1]) return { start: b[i], end: b[i + 1] };
+  const rec = mergeRanges(S.clips.map((c) => ({ start: c.start, end: clipEnd(c) })))
+    .find((r) => t >= r.start && t < r.end);
+  if (!rec) return null;
+  for (let i = 0; i < b.length - 1; i++) {
+    if (t >= b[i] && t < b[i + 1]) return { start: Math.max(b[i], rec.start), end: Math.min(b[i + 1], rec.end) };
+  }
   return null;
 }
 const selectedPiece = () => (ui.selPieceT == null ? null : pieceAt(ui.selPieceT));
@@ -1268,6 +1421,37 @@ function renderTransitions() {
   $('#trInfo').textContent = `${n('session')} session join(s), ${n('cut') + n('layout')} cut / layout change(s) get a dissolve (◆ on the Output row).`;
 }
 
+function renderMusic() {
+  const M = S.music;
+  $('#musicList').innerHTML = '';
+  M.tracks.forEach((t, i) => {
+    const row = document.createElement('div');
+    row.className = 'mrow' + (MUSIC_MISSING.has(t.id) ? ' missing-file' : '');
+    row.title = t.path;
+    row.innerHTML = `<span class="mname"></span><span class="muted">${fmtDur(t.duration)}</span>
+      <button title="Play earlier"${i ? '' : ' disabled'}>↑</button><button title="Remove">✕</button>`;
+    row.querySelector('.mname').textContent = `${i + 1}. ${MUSIC_MISSING.has(t.id) ? '⚠ ' : ''}${t.name}`;
+    const [up, rm] = row.querySelectorAll('button');
+    up.onclick = () => { [M.tracks[i - 1], M.tracks[i]] = [M.tracks[i], M.tracks[i - 1]]; renderMusic(); scheduleSave(); };
+    rm.onclick = () => { M.tracks.splice(i, 1); renderMusic(); scheduleSave(); };
+    $('#musicList').appendChild(row);
+  });
+  $('#musVol').value = M.volume; $('#musVolOut').value = `${Math.round(M.volume * 100)}%`;
+  const first = M.tracks[0] ? M.tracks[0].duration : 60;
+  $('#musOffset').max = Math.max(1, Math.floor(first - 1));
+  $('#musOffset').value = M.offset; $('#musOffsetOut').value = `${fmtDur(M.offset)}`;
+  $('#musFadeIn').value = M.fadeIn; $('#musFadeInOut').value = `${M.fadeIn} s`;
+  $('#musFadeOut').value = M.fadeOut; $('#musFadeOutOut').value = `${M.fadeOut} s`;
+  $('#musLoop').checked = !!M.loop;
+  $('#muteBtn').textContent = ui.muted ? '🔇' : '🔊';
+  const total = M.tracks.reduce((n, t) => n + t.duration, 0) - (M.offset || 0), D = outputSeconds();
+  $('#musInfo').textContent = !M.tracks.length
+    ? 'Songs play back to back over the exported video. 🔊 under the preview mutes it while you edit.'
+    : total >= D ? `Music ${fmtDur(total)} for a ${fmtDur(D)} video: it fades out at the end.`
+      : M.loop ? `Music ${fmtDur(total)} for a ${fmtDur(D)} video: it plays ${(D / total).toFixed(1)}× (loops).`
+        : `Music ${fmtDur(total)} for a ${fmtDur(D)} video: the last ${fmtDur(D - total)} is silent.`;
+}
+
 function renderDetect() {
   const D = S.detect;
   $('#autoCut').checked = !!D.auto;
@@ -1295,6 +1479,15 @@ function renderClipInfo() {
       <span>Analysis</span><span>${a.status || '—'}${a.status === 'running' ? ` ${Math.round(a.progress * 100)}%` : ''}</span>
     </div>
     <div class="numrow">Start <input type="number" id="clipStart" step="${(1 / fps()).toFixed(4)}" value="${c.start.toFixed(3)}"> s</div>
+    <div class="blurbox">
+      <div class="blurhead">Blur <span class="muted">${(S.blurs[c.id] || []).length || 'no'} area(s)</span>
+        ${(S.blurs[c.id] || []).map((b, i) => `<button class="chip" data-rmblur="${i}" title="${b.start == null ? 'Whole clip' : `Detected ${b.label || 'screen'} (${Math.round((b.score || 0) * 100)}%) · ${fmtVideo(b.start)}–${fmtVideo(b.end)}`} · click to remove">${i + 1}${b.start == null ? '' : ' auto'} ✕</button>`).join('')}</div>
+      <div class="row wrap">
+        <button class="btn small${ui.blurDraw ? ' on toggle' : ''}" id="blurDraw">${ui.blurDraw ? 'Drag on the picture… (Esc)' : '▭ Draw blur area'}</button>
+        <button class="btn small" id="blurDay" title="Same areas on this camera's other clips of the same day">Copy to same day</button>
+        <button class="btn small" id="blurAll" title="Same areas on all this camera's clips">Copy to all ${c.track}</button>
+      </div>
+    </div>
     <div class="row wrap">
       <button class="btn small" id="clipSwap">Move to ${c.track === 'A' ? 'B' : 'A'}</button>
       <button class="btn small" id="clipSync">Sync to other camera</button>
@@ -1306,6 +1499,28 @@ function renderClipInfo() {
   };
   $('#clipSwap').onclick = () => { pushUndo(); c.track = c.track === 'A' ? 'B' : 'A'; computeThresholds(); changed(); renderClipInfo(); };
   $('#clipSync').onclick = () => syncFromFootage([c]);
+  $('#blurDraw').onclick = () => (ui.blurDraw ? stopBlurDraw() : startBlurDraw(c));
+  for (const b of box.querySelectorAll('[data-rmblur]')) {
+    b.onclick = () => {
+      pushUndo();
+      S.blurs[c.id].splice(+b.dataset.rmblur, 1);
+      if (!S.blurs[c.id].length) delete S.blurs[c.id];
+      changed(false); renderClipInfo();
+    };
+  }
+  const copyBlur = (sameDay) => {
+    const day = (x) => new Date((x.creation_ts || x.mtime) * 1000).toDateString();
+    const to = clipsOf(c.track).filter((x) => x.id !== c.id && (!sameDay || day(x) === day(c)));
+    if (!to.length) { alert('No other clip to copy to.'); return; }
+    pushUndo();
+    for (const x of to) {
+      if (S.blurs[c.id]) S.blurs[x.id] = S.blurs[c.id].map(boxOnly); else delete S.blurs[x.id];   // whole clip there
+    }
+    changed(false);
+    $('#selInfo').textContent = `Blur areas copied to ${to.length} clip(s).`;
+  };
+  $('#blurDay').onclick = () => copyBlur(true);
+  $('#blurAll').onclick = () => copyBlur(false);
   $('#clipReanalyze').onclick = async () => {
     delete DIFFS[c.id]; delete ACT[c.id];
     for (const k of [...THUMBS.keys()]) if (k.startsWith(c.id)) THUMBS.delete(k);
@@ -1318,6 +1533,73 @@ function renderClipInfo() {
     computeThresholds(); changed(); renderClipInfo();
   };
 }
+
+// Find screens in the selected part (or the selected clip) and blur them there.
+async function autoBlurScreens() {
+  const sel = target();
+  const clip = S.clips.find((x) => x.id === ui.selClip);
+  const r = sel || (clip && { start: clip.start, end: clipEnd(clip) });
+  const info = $('#selInfo');
+  if (!r) { info.textContent = 'Select a part (click a piece or drag a range) or a clip first.'; return; }
+  const jobs = S.clips.filter((c) => c.start < r.end && clipEnd(c) > r.start && !MISSING.has(c.id))
+    .map((c) => ({ c, t0: Math.max(r.start, c.start) - c.start, t1: Math.min(r.end, clipEnd(c)) - c.start }))
+    .filter((j) => j.t1 - j.t0 > 1 / fps());
+  if (!jobs.length) { info.textContent = 'No footage in the selection.'; return; }
+  const btn = $('#autoBlurBtn');
+  btn.disabled = true;
+  const snap = snapshot();
+  let found = 0, clipsHit = 0;
+  try {
+    for (const [i, j] of jobs.entries()) {
+      info.textContent = `Looking for screens… ${j.c.name} (${i + 1}/${jobs.length})${i ? '' : ' — the first time loads the model, ~20 s'}`;
+      const res = await api('/api/detect_screens', { clip: j.c.id, t0: j.t0, t1: j.t1 });
+      if (res.error) throw new Error(res.error);
+      if (!res.boxes.length) continue;
+      clipsHit++; found += res.boxes.length;
+      const list = (S.blurs[j.c.id] = S.blurs[j.c.id] || []);
+      for (const b of res.boxes) list.push({ ...b, start: j.c.start + j.t0, end: j.c.start + j.t1, auto: true });
+    }
+    if (found) { pushUndo(snap); changed(false); if (ui.selClip) renderClipInfo(); }
+    info.textContent = found
+      ? `Blurred ${found} screen(s) in ${clipsHit} clip(s) for this part. Check the preview; remove a wrong one with its ✕ in the Clip panel (⌘Z undoes all).`
+      : 'No screen found in this part.';
+  } catch (e) {
+    info.textContent = `Screen detection failed: ${e.message}`;
+  } finally { btn.disabled = false; }
+}
+
+// Drawing a blur area: the clip's camera is shown alone, drag a box on the picture.
+function startBlurDraw(c) {
+  if (coverage(c.track, ui.t) !== c) seek(c.start + Math.min(1, c.duration / 2));
+  setPlaying(false);
+  ui.blurDraw = { clip: c.id, track: c.track, box: null };
+  renderClipInfo();
+}
+function stopBlurDraw() { ui.blurDraw = null; if (ui.selClip) renderClipInfo(); }
+$('#stage').addEventListener('mousedown', (e) => {
+  const d = ui.blurDraw;
+  if (!d) return;
+  const c = S.clips.find((x) => x.id === d.clip), v = vids[d.track];
+  if (!c || v.style.display !== 'block') return;
+  e.preventDefault();
+  const st = $('#stage').getBoundingClientRect(), pr = pictureRect(v, c);
+  const at = (ev) => ({ x: clamp((ev.clientX - st.left - pr.x) / pr.w, 0, 1), y: clamp((ev.clientY - st.top - pr.y) / pr.h, 0, 1) });
+  const p0 = at(e);
+  const move = (ev) => {
+    const p = at(ev);
+    d.box = { x: Math.min(p0.x, p.x), y: Math.min(p0.y, p.y), w: Math.abs(p.x - p0.x), h: Math.abs(p.y - p0.y) };
+  };
+  const up = () => {
+    window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
+    if (d.box && d.box.w > 0.01 && d.box.h > 0.01) {
+      pushUndo();
+      (S.blurs[c.id] = S.blurs[c.id] || []).push(d.box);
+      changed(false);
+    }
+    stopBlurDraw();
+  };
+  window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
+});
 
 function bindInspector() {
   for (const b of $$('#modeSeg button')) b.onclick = () => { S.layout.mode = b.dataset.mode; renderLayout(); scheduleSave(); };
@@ -1343,6 +1625,18 @@ function bindInspector() {
     }
   };
   $('#forgetKeepsBtn').onclick = () => { pushUndo(); S.keeps = []; changed(); };
+  for (const [sel, key] of [['#musVol', 'volume'], ['#musOffset', 'offset'], ['#musFadeIn', 'fadeIn'], ['#musFadeOut', 'fadeOut']]) {
+    $(sel).oninput = (e) => { S.music[key] = parseFloat(e.target.value); renderMusic(); scheduleSave(); };
+  }
+  $('#musLoop').onchange = (e) => { S.music.loop = e.target.checked; renderMusic(); scheduleSave(); };
+  $('#muteBtn').onclick = () => { ui.muted = !ui.muted; renderMusic(); };
+  $('#musicAddBtn').onclick = async () => {
+    const r = await api('/api/music/pick', {});
+    S.music.tracks = r.music.tracks;
+    MUSIC_MISSING = new Set(r.musicMissing || []);
+    $('#musicErr').textContent = (r.errors || []).join('\n');
+    renderMusic(); scheduleSave();
+  };
   for (const [sel, key] of [['#trSession', 'session'], ['#trCut', 'cut']]) {
     $(sel).oninput = (e) => { S.transitions[key] = parseInt(e.target.value, 10); changed(false); };
   }
@@ -1355,6 +1649,7 @@ function bindInspector() {
   $('#hideABtn').onclick = () => hideSel('A');
   $('#hideBBtn').onclick = () => hideSel('B');
   $('#unhideBtn').onclick = unhideSel;
+  $('#autoBlurBtn').onclick = autoBlurScreens;
   $('#alignBtn').onclick = () => alignClips($('#alignMode').value);
   $('#syncBtn').onclick = () => syncFromFootage(clipsOf('A').filter((c) => c.duration > 1));
   $('#playBtn').onclick = () => setPlaying(!ui.playing);
@@ -1439,7 +1734,7 @@ $('#exStart').onclick = async () => {
   S.output.lastPath = $('#exPath').value;
   scheduleSave();
   const r = await api('/api/export', {
-    segments: segments().map(({ dur, a, b, frames, fade, layout }) => ({ dur, a, b, frames, fade, layout })),
+    segments: segments().map(({ dur, a, b, frames, fade, layout, blur }) => ({ dur, a, b, frames, fade, layout, blur })),
     layout: S.layout, output: { ...S.output, path: $('#exPath').value }, fps: fps(),
   });
   if (r.error) $('#exStatus').textContent = r.error;
@@ -1530,7 +1825,7 @@ window.addEventListener('keydown', (e) => {
   else if (k === 'w' && !e.metaKey && !e.ctrlKey) swapHere();
   else if (k === 'h' && !e.metaKey && !e.ctrlKey) setCompact(!ui.compact);
   else if (k === 'x') cutSelection();
-  else if (k === 'Escape') { ui.selCut = -1; clearTarget(); }
+  else if (k === 'Escape') { if (ui.blurDraw) stopBlurDraw(); else { ui.selCut = -1; clearTarget(); } }
   else if (k === 'Backspace' || k === 'Delete') {
     if (ui.selCut >= 0) removeCut(ui.selCut);
     else if (target()) cutSelection();
@@ -1553,7 +1848,10 @@ async function boot() {
   S.splits = S.splits || [];
   S.overrides = S.overrides || [];
   S.transitions = S.transitions || { session: 12, cut: 4 };
-  renderTrackNames(); renderLayout(); renderDetect(); bindInspector(); updateSelInfo();
+  S.blurs = S.blurs || {};
+  S.music = { tracks: [], volume: 0.8, fadeIn: 1, fadeOut: 3, offset: 0, loop: true, ...(S.music || {}) };
+  MUSIC_MISSING = new Set(r.musicMissing || []);
+  renderTrackNames(); renderMusic(); renderLayout(); renderDetect(); bindInspector(); updateSelInfo();
   resizeCanvas(); fitStage(); zoomFit(); updateStats();
   for (const c of S.clips) if (AN[c.id] && AN[c.id].status === 'done') loadDiffs(c.id);
   const f0 = S.clips[0] && S.clips[0].fps;
