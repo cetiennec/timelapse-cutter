@@ -80,7 +80,13 @@ const normCuts = (list) => [...mergeRanges(list.filter((c) => !c.auto)), ...merg
 // ------------------------------------------------------------------ model
 
 const clipsOf = (track) => S.clips.filter((c) => c.track === track);
-const clipEnd = (c) => c.start + c.duration;
+// A clip shot at another photo interval than the project's (e.g. 5 s instead of 2 s) is
+// stretched on the timeline so both cameras show the same real time at the same place.
+const interval = (c) => c.interval || S.settings.interval || 2;
+const stretch = (c) => interval(c) / (S.settings.interval || 2);
+const span = (c) => c.duration * stretch(c);             // length on the timeline
+const srcT = (c, t) => (t - c.start) / stretch(c);       // timeline time -> time in the file
+const clipEnd = (c) => c.start + span(c);
 const timelineEnd = () => Math.max(1, ...S.clips.map(clipEnd));
 
 function coverage(track, t) {
@@ -104,7 +110,9 @@ function changed(redetect = true) {
   updateStats();
   scheduleSave();
   if (redetect) scheduleDetect();
+  if (TEXT) { clearTimeout(textTimer); textTimer = setTimeout(renderText, 200); }
 }
+let textTimer = null;
 
 let detectTimer = null;
 function scheduleDetect() {
@@ -116,7 +124,15 @@ function scheduleDetect() {
 // Blur areas belong to a clip; detected ones only apply between start and end (master time).
 const blurOn = (b, t) => b.start == null || (t >= b.start && t < b.end);
 const blursAt = (c, t) => (c && (S.blurs || {})[c.id] || []).filter((b) => blurOn(b, t));
-const boxOnly = ({ x, y, w, h }) => ({ x, y, w, h });
+const boxOnly = ({ x, y, w, h, pts }) => (pts ? { x, y, w, h, pts: pts.map((p) => [...p]) } : { x, y, w, h });
+// Corners of a blur area (fractions of the frame), clockwise from top-left: an area found
+// on a screen seen at an angle has its own; a drawn box has the box's four.
+const cornersOf = (b) => b.pts || [[b.x, b.y], [b.x + b.w, b.y], [b.x + b.w, b.y + b.h], [b.x, b.y + b.h]];
+function setCorners(b, pts) {
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  b.pts = pts;
+  b.x = Math.min(...xs); b.y = Math.min(...ys); b.w = Math.max(...xs) - b.x; b.h = Math.max(...ys) - b.y;
+}
 
 // Kept parts of the master timeline, split wherever the visible clips change.
 function segments() {
@@ -148,8 +164,8 @@ function segments() {
       if (!ca && !cb) continue;
       segs.push({
         start: s0, end: s1, dur: s1 - s0,
-        a: ca ? { clip: ca.id, t: s0 - ca.start } : null,
-        b: cb ? { clip: cb.id, t: s0 - cb.start } : null,
+        a: ca ? { clip: ca.id, t: srcT(ca, s0), stretch: stretch(ca) } : null,
+        b: cb ? { clip: cb.id, t: srcT(cb, s0), stretch: stretch(cb) } : null,
         layout: layoutAt(m),
         blur: { a: blursAt(ca, m).map(boxOnly), b: blursAt(cb, m).map(boxOnly) },
       });
@@ -182,6 +198,7 @@ function updateStats() {
   $('#forgetKeepsBtn').hidden = !S.keeps.length;
   renderTransitions();
   if (S.music) renderMusic();
+  renderOverrideInfo();
   $('#stats').innerHTML = S.clips.length
     ? `Timeline <b>${fmtDur(total)}</b> (${fmtReal(total)} real) → output <b>${fmtDur(outputSeconds())}</b>
        · cut ${total ? Math.round(100 * (1 - kept / total)) : 0}%`
@@ -191,12 +208,12 @@ function updateStats() {
 // ------------------------------------------------------------------ undo / save
 
 const snapshot = () => JSON.stringify({
-  clips: S.clips.map((c) => [c.id, c.start, c.track]), cuts: S.cuts, keeps: S.keeps, hidden: S.hidden,
+  clips: S.clips.map((c) => [c.id, c.start, c.track, c.interval || null]), cuts: S.cuts, keeps: S.keeps, hidden: S.hidden,
   splits: S.splits, overrides: S.overrides, blurs: S.blurs,
 });
 function restore(snap) {
   const o = JSON.parse(snap);
-  const m = new Map(o.clips.map(([id, start, track]) => [id, { start, track }]));
+  const m = new Map(o.clips.map(([id, start, track, iv]) => [id, { start, track, interval: iv }]));
   for (const c of S.clips) if (m.has(c.id)) Object.assign(c, m.get(c.id));
   S.cuts = o.cuts; S.keeps = o.keeps || []; S.hidden = o.hidden;
   S.splits = o.splits || []; S.overrides = o.overrides || []; S.blurs = o.blurs || {};
@@ -218,7 +235,7 @@ function scheduleSave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     await api('/api/state', {
-      clips: S.clips.map((c) => ({ id: c.id, start: c.start, track: c.track })),
+      clips: S.clips.map((c) => ({ id: c.id, start: c.start, track: c.track, interval: c.interval || null })),
       cuts: S.cuts, keeps: S.keeps, hidden: S.hidden, layout: S.layout, detect: S.detect,
       transitions: S.transitions, splits: S.splits, overrides: S.overrides,
       output: S.output, settings: S.settings, tracks: S.tracks, music: S.music, blurs: S.blurs,
@@ -280,7 +297,7 @@ function detectStill(manual = true) {
       const c = coverage(tr, t);
       if (!c) continue;
       const d = DIFFS[c.id];
-      const v = d.smooth[clamp(Math.floor((t - c.start) * f), 0, d.smooth.length - 1)];
+      const v = d.smooth[clamp(Math.floor(srcT(c, t) * f), 0, d.smooth.length - 1)];
       if (v > THR[tr]) { active = true; break; }
     }
     still[i] = active ? 0 : 1;
@@ -360,26 +377,76 @@ function boxRect(pr, b) {
 const blurEls = [];
 function layoutBlurs(ca, cb) {
   let n = 0;
-  const box = (r, z, radius, cls) => {
+  const box = (r, z, radius, cls, pts, pr) => {
     let el = blurEls[n];
     if (!el) { el = document.createElement('div'); $('#stage').appendChild(el); blurEls.push(el); }
     n++;
     el.className = cls;
+    const clip = pts ? `polygon(${pts.map(([x, y]) => `${(pr.x + x * pr.w - r.x).toFixed(1)}px ${(pr.y + y * pr.h - r.y).toFixed(1)}px`).join(',')})` : 'none';
     Object.assign(el.style, { display: 'block', left: `${r.x}px`, top: `${r.y}px`, width: `${r.w}px`, height: `${r.h}px`,
-      zIndex: z, backdropFilter: radius ? `blur(${radius}px)` : 'none', webkitBackdropFilter: radius ? `blur(${radius}px)` : 'none' });
+      zIndex: z, clipPath: clip, webkitClipPath: clip,
+      backdropFilter: radius ? `blur(${radius}px)` : 'none', webkitBackdropFilter: radius ? `blur(${radius}px)` : 'none' });
   };
   for (const [tr, c] of [['A', ca], ['B', cb]]) {
     const v = vids[tr];
     if (!c || v.style.display !== 'block') continue;
     const pr = pictureRect(v, c), z = (parseInt(v.style.zIndex, 10) || 0) + 1;
     const radius = Math.max(2, 0.02 * pr.h);
-    const mark = c.id === ui.selClip ? ' sel' : '';
-    for (const b of blursAt(c, ui.t)) { const r = boxRect(pr, b); if (r) box(r, z, radius, `stage-blur${mark}`); }
+    for (const b of blursAt(c, ui.t)) { const r = boxRect(pr, b); if (r) box(r, z, radius, 'stage-blur', b.pts, pr); }
     const d = ui.blurDraw;
     if (d && d.clip === c.id && d.box) { const r = boxRect(pr, d.box); if (r) box(r, z, radius, 'stage-blur drawing'); }
   }
   for (let i = n; i < blurEls.length; i++) blurEls[i].style.display = 'none';
+  layoutCorners(ca, cb);
 }
+
+// Outline and corner handles of the selected clip's blur areas: drag a corner to follow
+// a screen seen at an angle (a box becomes a four-corner shape).
+const cornerSvg = $('#blurCorners');
+function layoutCorners(ca, cb) {
+  const c = [ca, cb].find((x) => x && x.id === ui.selClip);
+  const v = c && vids[c.track];
+  let html = '';
+  if (c && v.style.display === 'block' && !ui.blurDraw) {
+    const pr = pictureRect(v, c);
+    const all = S.blurs[c.id] || [];
+    for (const b of blursAt(c, ui.t)) {
+      const i = all.indexOf(b);
+      const pts = cornersOf(b).map(([x, y]) => [pr.x + x * pr.w, pr.y + y * pr.h]);
+      html += `<polygon points="${pts.map((p) => p.join(',')).join(' ')}"/>`;
+      html += pts.map(([x, y], k) => `<circle cx="${x}" cy="${y}" r="5" data-area="${i}" data-corner="${k}"/>`).join('');
+    }
+  }
+  const h = ui.textHit, m = h && TEXT && textPlace(h);
+  const tc = m && [ca, cb].find((x) => x && x.id === m.c.id);
+  if (tc && vids[tc.track].style.display === 'block' && ui.t >= m.t0 - m.pad && ui.t <= m.t1 + m.pad) {
+    const pr = pictureRect(vids[tc.track], tc), r = boxRect(pr, { x: h.box[0], y: h.box[1], w: h.box[2], h: h.box[3] });
+    if (r) html += `<rect class="textmark" x="${r.x - 4}" y="${r.y - 4}" width="${r.w + 8}" height="${r.h + 8}" rx="3"/>`;
+  }
+  if (cornerSvg._html !== html) { cornerSvg.innerHTML = html; cornerSvg._html = html; }
+}
+cornerSvg.addEventListener('mousedown', (e) => {
+  const h = e.target.closest('circle');
+  if (!h) return;
+  const c = S.clips.find((x) => x.id === ui.selClip), v = c && vids[c.track];
+  const b = c && (S.blurs[c.id] || [])[+h.dataset.area];
+  if (!b) return;
+  e.preventDefault(); e.stopPropagation();
+  setPlaying(false);
+  const snap = snapshot(), k = +h.dataset.corner, st = $('#stage').getBoundingClientRect();
+  let moved = false;
+  const move = (ev) => {
+    const pr = pictureRect(v, c), pts = cornersOf(b).map((p) => [...p]);
+    pts[k] = [clamp((ev.clientX - st.left - pr.x) / pr.w, 0, 1), clamp((ev.clientY - st.top - pr.y) / pr.h, 0, 1)];
+    setCorners(b, pts); moved = true;
+    layoutStage(coverage('A', ui.t), coverage('B', ui.t));
+  };
+  const up = () => {
+    window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up);
+    if (moved) { pushUndo(snap); changed(false); }
+  };
+  window.addEventListener('mousemove', move); window.addEventListener('mouseup', up);
+});
 
 function layoutStage(ca, cb) {
   layoutVideos(ca, cb);
@@ -429,21 +496,22 @@ function syncVideo(tr, clip) {
     // current picture on top meanwhile instead of flashing black.
     if (v.style.display === 'block' && v.readyState >= 2) startFade(0, true);
     v._clip = clip.id; v._ready = false;
-    v.src = `/media/${clip.id}`;
+    v.src = `/media/${clip.id}${clip.rev ? `?v=${clip.rev}` : ''}`;
     v.onloadedmetadata = () => { v._ready = true; };
   }
   if (!v._ready) return;
-  const want = clamp(ui.t - clip.start, 0, Math.max(0, (v.duration || clip.duration) - 0.001));
+  const want = clamp(srcT(clip, ui.t), 0, Math.max(0, (v.duration || clip.duration) - 0.001));
+  const speed = ui.speed / stretch(clip);
   if (ui.playing) {
     if (v.paused) v.play().catch(() => {});
     const drift = v.currentTime - want;   // seconds of video, > 0 = ahead
-    if (Math.abs(drift) > Math.max(1, 0.5 * ui.speed)) {
+    if (Math.abs(drift) > Math.max(1, 0.5 * speed)) {
       v.currentTime = want;               // far off (e.g. after a stall): jump
-      v.playbackRate = ui.speed;
+      v.playbackRate = speed;
     } else {
       // Close: speed up / slow down slightly so it catches up within about a second,
       // keeping both cameras within a frame or two instead of a seek tolerance.
-      const rate = clamp(ui.speed - drift, ui.speed * 0.5, ui.speed * 1.5);
+      const rate = clamp(speed - drift, speed * 0.5, speed * 1.5);
       if (Math.abs(v.playbackRate - rate) > 0.005) v.playbackRate = rate;
     }
   } else {
@@ -470,7 +538,7 @@ function tick(now) {
       for (const tr of TRACKS) {
         const c = coverage(tr, ui.t), v = vids[tr];
         if (c && v._clip === c.id && !v.paused && !v.seeking && !v.ended && v.readyState >= 3) {
-          const vt = c.start + v.currentTime;
+          const vt = c.start + v.currentTime * stretch(c);
           if (vt >= ui.t - 0.05 && vt <= ui.t + 0.5 * ui.speed) { next = Math.max(ui.t, vt); break; }
         }
       }
@@ -504,6 +572,8 @@ function tick(now) {
     const ca = coverage('A', ui.t), cb = coverage('B', ui.t);
     syncVideo('A', ca); syncVideo('B', cb); syncMusic();
     layoutStage(ca, cb);
+    const ov = rangeAt(S.overrides, ui.t);
+    if (ov !== ui.lastOv) { ui.lastOv = ov; renderOverrideInfo(); }
     $('#stageEmpty').style.display = S.clips.length ? 'none' : 'flex';
     $('#stageCut').style.display = rangeAt(S.cuts, ui.t) >= 0 ? 'block' : 'none';
     $('#tcVideo').textContent = fmtVideo(ui.t);
@@ -540,6 +610,11 @@ function startFade(dur, hold = false) {
       if (!r) continue;
       g.save();
       g.beginPath(); g.rect(r.x, r.y, r.w, r.h); g.clip();
+      if (b.pts) {
+        g.beginPath();
+        b.pts.forEach(([px, py], i) => g[i ? 'lineTo' : 'moveTo'](pr.x + px * pr.w, pr.y + py * pr.h));
+        g.closePath(); g.clip();
+      }
       g.globalAlpha = parseFloat(v.style.opacity || '1');
       g.filter = `blur(${Math.max(2, 0.02 * pr.h)}px)`;
       g.drawImage(v, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
@@ -755,7 +830,8 @@ function getThumb(id, n) {
     im = new Image();
     im.onload = () => { drawDirty = true; };
     im.onerror = () => { im.failed = true; };
-    im.src = `/thumb/${id}/${n}.jpg`;
+    const rev = (S.clips.find((c) => c.id === id) || {}).rev;
+    im.src = `/thumb/${id}/${n}.jpg${rev ? `?v=${rev}` : ''}`;
     THUMBS.set(key, im);
   }
   return im.complete && !im.failed && im.naturalWidth ? im : null;
@@ -937,7 +1013,7 @@ function drawClip(g, c, x0, x1, y, W) {
     const first = x0 + Math.floor((vx0 - x0) / tw) * tw;
     g.save(); g.beginPath(); g.rect(x0, y, x1 - x0, TRACK_H); g.clip();
     for (let x = first; x < vx1; x += tw) {
-      const lt = tOf(x + tw / 2) - c.start;
+      const lt = srcT(c, tOf(x + tw / 2));
       const n = clamp(Math.floor((lt * c.fps) / d.thumbEvery) + 1, 1, d.nThumbs);
       const im = getThumb(c.id, n);
       if (im) g.drawImage(im, x, ty, tw, th);
@@ -949,8 +1025,8 @@ function drawClip(g, c, x0, x1, y, W) {
     const thr = THR[c.track], top = thr * 2.5;
     const sm = d.smooth;
     for (let x = Math.floor(vx0); x < vx1; x++) {
-      const f0 = Math.floor((tOf(x) - c.start) * c.fps);
-      const f1 = Math.max(f0 + 1, Math.floor((tOf(x + 1) - c.start) * c.fps));
+      const f0 = Math.floor(srcT(c, tOf(x)) * c.fps);
+      const f1 = Math.max(f0 + 1, Math.floor(srcT(c, tOf(x + 1)) * c.fps));
       let v = 0;
       for (let f = Math.max(0, f0); f < Math.min(sm.length, f1); f++) if (sm[f] > v) v = sm[f];
       const hgt = Math.min(1, v / top) * (GRAPH_H - 2);
@@ -977,7 +1053,7 @@ function drawClip(g, c, x0, x1, y, W) {
   g.fillStyle = 'rgba(0,0,0,0.55)'; g.fillRect(x0, y, x1 - x0, NAME_H);
   g.save(); g.beginPath(); g.rect(x0, y, x1 - x0, NAME_H); g.clip();
   g.fillStyle = '#e6e7e9'; g.font = '11px -apple-system';
-  g.fillText(`${c.name} · ${fmtReal(c.duration)}`, Math.max(x0, LABEL_W) + 5, y + 11);
+  g.fillText(`${c.name} · ${fmtReal(span(c))}${stretch(c) !== 1 ? ` · 1 photo / ${interval(c)} s` : ''}`, Math.max(x0, LABEL_W) + 5, y + 11);
   g.restore();
   g.strokeStyle = sel ? '#fff' : '#0d0e10'; g.lineWidth = sel ? 2 : 1;
   g.strokeRect(x0 + 0.5, y + 0.5, x1 - x0 - 1, TRACK_H - 1);
@@ -1096,7 +1172,7 @@ window.addEventListener('mousemove', (e) => {
     const targets = [0, ui.t];
     for (const c of S.clips) if (!moving.has(c)) targets.push(c.start, clipEnd(c));
     let best = 8 / ui.view.pps;
-    for (const cand of [s0 + dt, s0 + dt + c0.duration]) {
+    for (const cand of [s0 + dt, s0 + dt + span(c0)]) {
       for (const tg of targets) if (Math.abs(tg - cand) < best) { best = Math.abs(tg - cand); dt += tg - cand; }
     }
     const minStart = Math.min(...drag.starts.map(([, s]) => s));
@@ -1173,8 +1249,10 @@ const selectedPiece = () => (ui.selPieceT == null ? null : pieceAt(ui.selPieceT)
 // Edit actions apply to the dragged range if any, else to the selected piece.
 const target = () => ui.sel || selectedPiece();
 
-function needTarget() {
-  const r = target();
+// Layout and hide actions without a selection apply to the piece under the playhead.
+function needTarget(atPlayhead = false) {
+  let r = target();
+  if (!r && atPlayhead && (r = pieceAt(ui.t))) { ui.selPieceT = ui.t; drawDirty = true; }
   if (!r) $('#selInfo').textContent = 'Select something first: click a piece (split with ⌘B), or drag in an empty part of a track.';
   return r;
 }
@@ -1205,20 +1283,20 @@ function restoreSelection() {
   changed();
 }
 function hideSel(tr) {
-  const r = needTarget(); if (!r) return;
+  const r = needTarget(true); if (!r) return;
   pushUndo();
   S.hidden[tr] = mergeRanges([...(S.hidden[tr] || []), { start: r.start, end: r.end }]);
   changed();
 }
 function unhideSel() {
-  const r = needTarget(); if (!r) return;
+  const r = needTarget(true); if (!r) return;
   pushUndo();
   for (const tr of TRACKS) S.hidden[tr] = subtractRange(S.hidden[tr] || [], r.start, r.end);
   changed();
 }
 // value: '' (default layout), 'pip:A' / 'pip:B', or a mode name.
 function setLayoutHere(value) {
-  const r = needTarget(); if (!r) return;
+  const r = needTarget(true); if (!r) { updateSelInfo(); return; }
   pushUndo();
   S.overrides = subtractRange(S.overrides, r.start, r.end);
   if (value) {
@@ -1226,10 +1304,10 @@ function setLayoutHere(value) {
     S.overrides = [...S.overrides, { start: r.start, end: r.end, mode, ...(main ? { main } : {}) }]
       .sort((a, b) => a.start - b.start);
   }
-  updateSelInfo(); changed(false);
+  updateSelInfo(); changed(false); renderOverrideInfo();
 }
 function swapHere() {
-  const r = needTarget(); if (!r) return;
+  const r = needTarget(true); if (!r) return;
   const L = layoutAt((r.start + r.end) / 2);
   const main = L.mode === 'pip' ? L.main : S.layout.main;
   setLayoutHere(`pip:${main === 'A' ? 'B' : 'A'}`);
@@ -1249,22 +1327,56 @@ function updateSelInfo() {
 // same scene, so their activity graphs move together: for a clip, find the time
 // shift against the other camera that makes them match best, window by window.
 
-const ACT = {};   // clip id -> log activity, lightly smoothed (cached)
+const ACT = {};   // clip id -> log activity, lightly smoothed, one value per timeline frame (cached)
 function activityOf(c) {
-  if (ACT[c.id]) return ACT[c.id];
+  const k = stretch(c);
+  if (ACT[c.id] && ACT[c.id].k === k) return ACT[c.id].a;
   const sm = DIFFS[c.id].smooth, n = sm.length, out = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     let s = 0, k = 0;
     for (let j = Math.max(0, i - 2); j <= Math.min(n - 1, i + 2); j++) { s += Math.log1p(sm[j]); k++; }
     out[i] = s / k;
   }
-  return (ACT[c.id] = out);
+  // A stretched clip holds each of its frames for k timeline frames.
+  const a = k === 1 ? out : Float32Array.from({ length: Math.round(n * k) }, (_, i) => out[Math.min(n - 1, Math.floor(i / k))]);
+  ACT[c.id] = { k, a };
+  return a;
+}
+
+// Offer to fix clips whose file dates say they were shot at another interval (asked once per clip).
+function checkIntervals() {
+  const seen = (S.settings.intervalSeen = S.settings.intervalSeen || []);
+  const odd = S.clips.filter((c) => c.interval_guess && Math.abs(c.interval_guess - interval(c)) > 0.01
+    && !seen.includes(`${c.id}:${c.interval_guess}`));
+  if (!odd.length || $('#intervalDlg').open) return;
+  $('#ivProject').textContent = S.settings.interval;
+  $('#ivReport').textContent = odd.map((c) => `${c.name}  (camera ${c.track}): 1 photo every ${c.interval_guess} s`
+    + ` → ${fmtReal(c.duration * c.interval_guess / S.settings.interval)} real, not ${fmtReal(span(c))}`).join('\n');
+  $('#intervalDlg').onclose = () => {
+    seen.push(...odd.map((c) => `${c.id}:${c.interval_guess}`));
+    if ($('#intervalDlg').returnValue === 'apply') setIntervals(odd.map((c) => [c, c.interval_guess]));
+    else scheduleSave();
+  };
+  $('#intervalDlg').showModal();
+}
+
+// Set the photo interval of clips, then put them back in time with the other camera.
+function setIntervals(list) {
+  list = list.filter(([c, iv]) => iv > 0 && Math.abs(iv - interval(c)) > 1e-6);
+  if (!list.length) { if (ui.selClip) renderClipInfo(); return; }
+  pushUndo();
+  for (const [c, iv] of list) c.interval = Math.abs(iv - S.settings.interval) < 1e-6 ? null : iv;
+  changed();
+  if (ui.selClip) renderClipInfo();
+  const ready = list.map(([c]) => c).filter((c) => DIFFS[c.id] && DIFFS[c.id].smooth);
+  // Its old place was measured at the wrong speed, so search further than usual.
+  if (ready.length === list.length) syncFromFootage(ready, 45);
 }
 
 // Lag in frames such that an event at master frame m on `ref` shows at m + lag in `clip`.
-function measureLag(clip, ref) {
+function measureLag(clip, ref, searchMin = 15) {
   const f = fps();
-  const maxLag = Math.round((15 * 60) / S.settings.interval);   // search ±15 min real
+  const maxLag = Math.round((searchMin * 60) / S.settings.interval);   // search ±15 min real
   const win = Math.round((25 * 60) / S.settings.interval);      // 25-min windows
   const a = activityOf(clip), n = a.length;
   const s0 = Math.round(clip.start * f), base = s0 - maxLag, len = n + 2 * maxLag;
@@ -1299,14 +1411,14 @@ function measureLag(clip, ref) {
   return { lag: lags[Math.floor(lags.length / 2)], windows: found.length, spread: lags[lags.length - 1] - lags[0] };
 }
 
-function syncFromFootage(clips) {
+function syncFromFootage(clips, searchMin = 15) {
   const pending = S.clips.filter((c) => !(DIFFS[c.id] && DIFFS[c.id].smooth));
   if (pending.length) { alert(`Wait for the analysis of ${pending.length} clip(s) to finish.`); return; }
   const f = fps(), realMin = (frames) => (frames * S.settings.interval) / 60;
   const lines = [];
   const moves = [];
   const fmtMin = (mins) => (Math.abs(mins) < 0.05 ? 'already in sync' : `moved ${mins > 0 ? '+' : ''}${mins.toFixed(1)} min`);
-  const measured = clips.map((c) => [c, measureLag(c, c.track === 'A' ? 'B' : 'A')]);
+  const measured = clips.map((c) => [c, measureLag(c, c.track === 'A' ? 'B' : 'A', searchMin)]);
   for (const [c, m] of measured) {
     if (m) {
       const drift = realMin(m.spread) > 1 ? ` (varies by ${realMin(m.spread).toFixed(1)} min inside the clip)` : '';
@@ -1340,8 +1452,8 @@ function alignClips(mode) {
   if (!S.clips.length) return;
   pushUndo();
   const r = ratio();
-  const wall = (c) => mode === 'creation' ? (c.creation_ts ?? c.name_ts ?? (c.mtime - c.duration * r))
-    : mode === 'mtime' ? c.mtime - c.duration * r
+  const wall = (c) => mode === 'creation' ? (c.creation_ts ?? c.name_ts ?? (c.mtime - span(c) * r))
+    : mode === 'mtime' ? c.mtime - span(c) * r
     : mode === 'name' ? c.name_ts : null;
   const known = S.clips.filter((c) => wall(c) != null);
   const origin = known.length ? Math.min(...known.map(wall)) : 0;
@@ -1400,6 +1512,19 @@ function renderTrackNames() {
   for (const el of $$('.tname')) el.textContent = S.tracks[el.dataset.track].name;
 }
 
+// Per-part layouts win over the default: say so, or the default panel seems to do nothing.
+function renderOverrideInfo() {
+  const el = $('#layoutOverrideInfo'), O = S.overrides;
+  $('#clearLayoutsBtn').hidden = !O.length;
+  if (!O.length) { el.hidden = true; return; }
+  const covered = O.reduce((n, o) => n + o.end - o.start, 0), total = timelineEnd();
+  const here = O.find((o) => ui.t >= o.start && ui.t < o.end);
+  el.hidden = false;
+  el.textContent = `${O.length} part${O.length > 1 ? 's have their' : ' has its'} own layout (${Math.round((100 * covered) / total)}% of the timeline)`
+    + (here ? `, including the playhead: “${layoutLabel(here)}” is shown here, not this default.` : '; this default applies elsewhere.')
+    + ' Change a part in Edit → Layout here, or reset them all there.';
+}
+
 function renderLayout() {
   const L = S.layout;
   for (const b of $$('#modeSeg button')) b.classList.toggle('on', b.dataset.mode === L.mode);
@@ -1409,6 +1534,7 @@ function renderLayout() {
   $('#pipBorder').value = L.border; $('#pipBorderOut').value = `${L.border}px`;
   $('#blendOp').value = L.opacity; $('#blendOpOut').value = `${Math.round(L.opacity * 100)}%`;
   $('#fill').checked = !!L.fill;
+  renderOverrideInfo();
 }
 
 function renderTransitions() {
@@ -1473,12 +1599,14 @@ function renderClipInfo() {
     <div class="kv">
       <span>File</span><span title="${c.path}">${c.name}</span>
       <span>Camera</span><span>${S.tracks[c.track].name}</span>
-      <span>Length</span><span>${fmtDur(c.duration)} video · ${fmtReal(c.duration)} real</span>
+      <span>Length</span><span>${fmtDur(c.duration)} video · ${fmtReal(span(c))} real</span>
       <span>Format</span><span>${c.width}×${c.height} ${c.codec || ''} ${Math.round(c.fps)} fps</span>
       <span>Recorded</span><span>${ts}</span>
       <span>Analysis</span><span>${a.status || '—'}${a.status === 'running' ? ` ${Math.round(a.progress * 100)}%` : ''}</span>
     </div>
     <div class="numrow">Start <input type="number" id="clipStart" step="${(1 / fps()).toFixed(4)}" value="${c.start.toFixed(3)}"> s</div>
+    <div class="numrow" title="How often this camera took a photo for this clip. A clip shot at another interval than the project (${S.settings.interval} s) is stretched to stay in time with the other camera.">One photo every <input type="number" id="clipInterval" min="0.1" max="600" step="0.5" value="${interval(c)}"> s
+      ${c.interval_guess && Math.abs(c.interval_guess - interval(c)) > 0.01 ? `<button class="btn small" id="clipIntervalGuess">Use ${c.interval_guess} s (from the file dates)</button>` : ''}</div>
     <div class="blurbox">
       <div class="blurhead">Blur <span class="muted">${(S.blurs[c.id] || []).length || 'no'} area(s)</span>
         ${(S.blurs[c.id] || []).map((b, i) => `<button class="chip" data-rmblur="${i}" title="${b.start == null ? 'Whole clip' : `Detected ${b.label || 'screen'} (${Math.round((b.score || 0) * 100)}%) · ${fmtVideo(b.start)}–${fmtVideo(b.end)}`} · click to remove">${i + 1}${b.start == null ? '' : ' auto'} ✕</button>`).join('')}</div>
@@ -1497,6 +1625,8 @@ function renderClipInfo() {
   $('#clipStart').onchange = (e) => {
     pushUndo(); c.start = Math.max(0, frameRound(parseFloat(e.target.value) || 0)); changed();
   };
+  $('#clipInterval').onchange = (e) => setIntervals([[c, parseFloat(e.target.value)]]);
+  if ($('#clipIntervalGuess')) $('#clipIntervalGuess').onclick = () => setIntervals([[c, c.interval_guess]]);
   $('#clipSwap').onclick = () => { pushUndo(); c.track = c.track === 'A' ? 'B' : 'A'; computeThresholds(); changed(); renderClipInfo(); };
   $('#clipSync').onclick = () => syncFromFootage([c]);
   $('#blurDraw').onclick = () => (ui.blurDraw ? stopBlurDraw() : startBlurDraw(c));
@@ -1543,17 +1673,19 @@ async function autoBlurScreens() {
   if (!r) { info.textContent = 'Select a part (click a piece or drag a range) or a clip first.'; return; }
   const jobs = S.clips.filter((c) => c.start < r.end && clipEnd(c) > r.start && !MISSING.has(c.id))
     .map((c) => ({ c, t0: Math.max(r.start, c.start) - c.start, t1: Math.min(r.end, clipEnd(c)) - c.start }))
+    .map((j) => ({ ...j, s0: j.t0 / stretch(j.c), s1: j.t1 / stretch(j.c) }))
     .filter((j) => j.t1 - j.t0 > 1 / fps());
   if (!jobs.length) { info.textContent = 'No footage in the selection.'; return; }
   const btn = $('#autoBlurBtn');
   btn.disabled = true;
   const snap = snapshot();
-  let found = 0, clipsHit = 0;
+  let found = 0, clipsHit = 0, note = '';
   try {
     for (const [i, j] of jobs.entries()) {
-      info.textContent = `Looking for screens… ${j.c.name} (${i + 1}/${jobs.length})${i ? '' : ' — the first time loads the model, ~20 s'}`;
-      const res = await api('/api/detect_screens', { clip: j.c.id, t0: j.t0, t1: j.t1 });
+      info.textContent = `Looking for screens… ${j.c.name} (${i + 1}/${jobs.length})${i ? '' : ' — the first time loads the models, ~30 s'}`;
+      const res = await api('/api/detect_screens', { clip: j.c.id, t0: j.s0, t1: j.s1 });
       if (res.error) throw new Error(res.error);
+      if (res.note) note = ` (Screen ${res.note}.)`;
       if (!res.boxes.length) continue;
       clipsHit++; found += res.boxes.length;
       const list = (S.blurs[j.c.id] = S.blurs[j.c.id] || []);
@@ -1561,16 +1693,146 @@ async function autoBlurScreens() {
     }
     if (found) { pushUndo(snap); changed(false); if (ui.selClip) renderClipInfo(); }
     info.textContent = found
-      ? `Blurred ${found} screen(s) in ${clipsHit} clip(s) for this part. Check the preview; remove a wrong one with its ✕ in the Clip panel (⌘Z undoes all).`
+      ? `Blurred ${found} screen(s) in ${clipsHit} clip(s) for this part, following their corners. Check the preview: click the clip and drag a yellow corner to adjust, or remove a wrong one with its ✕ in the Clip panel (⌘Z undoes all).${note}`
       : 'No screen found in this part.';
   } catch (e) {
     info.textContent = `Screen detection failed: ${e.message}`;
   } finally { btn.disabled = false; }
 }
 
+// ------------------------------------------------------------------ readable text
+
+// The last text check: each hit is text found in a clip (clip seconds s0..s1, box in
+// fractions of the frame), with what it looks like ("email", "key", … "text", "minor").
+let TEXT = null;
+const TEXT_LABEL = { key: 'key', password: 'password', email: 'email', iban: 'IBAN', card: 'card number', phone: 'phone',
+  url: 'web address', token: 'code', text: 'text', minor: 'label' };
+const PRIVATE = new Set(['key', 'password', 'email', 'iban', 'card', 'phone', 'url', 'token']);
+
+// How big a camera's picture is in the export (fraction of the frame): text too small to
+// read at that size is not a worry.
+function shownSize(lay, k) {
+  const tr = k === 'a' ? 'A' : 'B';
+  if (lay.mode === 'pip' && lay.main !== tr) return [lay.size, lay.size];
+  return lay.mode === 'sbs' ? [0.5, 1] : lay.mode === 'stack' ? [1, 0.5] : [1, 1];
+}
+
+// What to read: the kept parts (or the selected part) of each visible camera, as ranges
+// in clip seconds, with a frame every `every` seconds of the final video.
+function textJobs() {
+  const sel = target();
+  const step = (parseFloat($('#textEvery').value) || 1) * (S.output.speed || 1);   // timeline seconds
+  const ranges = {};
+  for (const sg of segments()) {
+    const s0 = sel ? Math.max(sg.start, sel.start) : sg.start, s1 = sel ? Math.min(sg.end, sel.end) : sg.end;
+    if (s1 <= s0) continue;
+    for (const k of ['a', 'b']) {
+      const p = sg[k];
+      if (!p || sg.layout.mode === (k === 'a' ? 'B' : 'A') || MISSING.has(p.clip)) continue;
+      const a = p.t + (s0 - sg.start) / p.stretch, b = p.t + (s1 - sg.start) / p.stretch;
+      const one = sg.a && sg.b ? shownSize(sg.layout, k) : [1, 1];   // alone, a camera fills the frame
+      const w = Math.round(S.output.width * one[0]), h = Math.round(S.output.height * one[1]);
+      const list = (ranges[p.clip] = ranges[p.clip] || []), last = list[list.length - 1];
+      if (last && last.w === w && last.h === h && a - last.s1 < step / p.stretch) last.s1 = b;
+      else list.push({ clip: p.clip, s0: a, s1: b, step: step / p.stretch, w, h });
+    }
+  }
+  return Object.values(ranges).flat();
+}
+
+async function startTextScan() {
+  const jobs = textJobs();
+  if (!jobs.length) { $('#textInfo').textContent = 'No footage to check (everything is cut?).'; return; }
+  const r = await api('/api/textscan', { jobs });
+  $('#textInfo').textContent = r.error || 'Starting…';
+}
+
+function inPoly([x, y], poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+// A hit on the timeline, or null when its clip is gone, the part is cut since, or a blur
+// area covers it.
+function textPlace(h) {
+  const c = S.clips.find((x) => x.id === h.clip);
+  if (!c) return null;
+  const k = stretch(c), pad = ((TEXT.steps || {})[h.clip] || 1) * k / 2;
+  const t0 = c.start + h.s0 * k, t1 = c.start + h.s1 * k;
+  if (!segments().some((sg) => sg.end > t0 - pad && sg.start < t1 + pad && (sg.a?.clip === c.id || sg.b?.clip === c.id))) return null;
+  const mid = [h.box[0] + h.box[2] / 2, h.box[1] + h.box[3] / 2];
+  if (blursAt(c, (t0 + t1) / 2).some((b) => inPoly(mid, cornersOf(b)))) return { c, t0, t1, pad, covered: true };
+  return { c, t0, t1, pad };
+}
+
+function textBlur(h, m) {
+  const pad = Math.max(0.008, h.box[3] * 0.6);
+  const x = clamp(h.box[0] - pad, 0, 1), y = clamp(h.box[1] - pad, 0, 1);
+  (S.blurs[m.c.id] = S.blurs[m.c.id] || []).push({
+    x, y, w: Math.min(1, h.box[0] + h.box[2] + pad) - x, h: Math.min(1, h.box[1] + h.box[3] + pad) - y,
+    start: Math.max(m.c.start, m.t0 - m.pad), end: Math.min(clipEnd(m.c), m.t1 + m.pad), auto: true, label: 'text',
+  });
+}
+
+function renderText() {
+  const list = $('#textList');
+  list.innerHTML = '';
+  $('#textTools').hidden = !(TEXT && TEXT.hits);
+  if (!TEXT || !TEXT.hits) return;
+  const all = $('#textAll').checked;
+  let covered = 0, minor = 0;
+  const rows = [];
+  for (const h of TEXT.hits) {
+    const m = textPlace(h);
+    if (!m) continue;
+    if (m.covered) { covered++; continue; }
+    if (h.kind === 'minor' && !all) { minor++; continue; }
+    rows.push({ h, m, priv: PRIVATE.has(h.kind) });
+  }
+  rows.sort((a, b) => b.priv - a.priv || a.m.t0 - b.m.t0);
+  const priv = rows.filter((r) => r.priv);
+  for (const { h, m, priv: p } of rows) {
+    const row = document.createElement('div');
+    row.className = 'mrow' + (p ? ' private' : '') + (ui.textHit === h ? ' on' : '');
+    row.title = `${m.c.name} · ${TEXT_LABEL[h.kind]} · seen on ${h.n} frame(s)${h.also ? ` · also read as: ${h.also.join(', ')}` : ''} · click to show it`;
+    row.innerHTML = `<span class="tkind"></span><span class="mname"></span><span class="muted small">${m.c.track} ${fmtVideo(m.t0)}${h.n > 1 ? ` ×${h.n}` : ''}</span><button title="Blur it there">▭</button>`;
+    row.querySelector('.tkind').textContent = TEXT_LABEL[h.kind];
+    row.querySelector('.mname').textContent = h.text;
+    row.onclick = () => { ui.textHit = h; setPlaying(false); seek(m.t0); followPlayhead(); renderText(); };
+    row.querySelector('button').onclick = (e) => {
+      e.stopPropagation();
+      pushUndo(); textBlur(h, m); changed(false); renderText();
+    };
+    list.appendChild(row);
+  }
+  $('#textBlurAll').disabled = !priv.length;
+  $('#textBlurAll').onclick = () => { pushUndo(); for (const r of priv) textBlur(r.h, r.m); changed(false); renderText(); };
+  $('#textInfo').textContent = `${TEXT.frames} frames read: ${priv.length ? `${priv.length} look private` : 'nothing looks private'}`
+    + `, ${rows.length - priv.length} other text` + (minor ? `, ${minor} labels or numbers hidden` : '')
+    + (covered ? `, ${covered} already blurred` : '') + '. Click one to see it in the preview (red box).';
+}
+
+let textWasRunning = false;
+async function renderTextScan(ts) {
+  const running = !!ts.running;
+  $('#textScanBtn').disabled = running; $('#textCancelBtn').hidden = !running;
+  $('#textProgress').hidden = !running;
+  if (running) {
+    $('#textProgress > div').style.width = `${Math.round((ts.progress || 0) * 100)}%`;
+    $('#textInfo').textContent = `${ts.step} · ${Math.round((ts.progress || 0) * 100)}%`;
+  } else if (textWasRunning) {
+    if (ts.error) $('#textInfo').textContent = `Text check failed: ${ts.error}`;
+    else { TEXT = await api('/api/textscan'); renderText(); }
+  }
+  textWasRunning = running;
+}
+
 // Drawing a blur area: the clip's camera is shown alone, drag a box on the picture.
 function startBlurDraw(c) {
-  if (coverage(c.track, ui.t) !== c) seek(c.start + Math.min(1, c.duration / 2));
+  if (coverage(c.track, ui.t) !== c) seek(c.start + Math.min(1, span(c) / 2));
   setPlaying(false);
   ui.blurDraw = { clip: c.id, track: c.track, box: null };
   renderClipInfo();
@@ -1650,6 +1912,13 @@ function bindInspector() {
   $('#hideBBtn').onclick = () => hideSel('B');
   $('#unhideBtn').onclick = unhideSel;
   $('#autoBlurBtn').onclick = autoBlurScreens;
+  $('#textScanBtn').onclick = startTextScan;
+  $('#textCancelBtn').onclick = () => api('/api/textscan/cancel', {});
+  $('#textAll').onchange = renderText;
+  $('#clearLayoutsBtn').onclick = () => {
+    if (!confirm(`Remove the ${S.overrides.length} per-part layout(s)? The default layout will apply everywhere (⌘Z undoes).`)) return;
+    pushUndo(); S.overrides = []; updateSelInfo(); changed(false); renderOverrideInfo();
+  };
   $('#alignBtn').onclick = () => alignClips($('#alignMode').value);
   $('#syncBtn').onclick = () => syncFromFootage(clipsOf('A').filter((c) => c.duration > 1));
   $('#playBtn').onclick = () => setPlaying(!ui.playing);
@@ -1685,6 +1954,7 @@ async function afterAdd(r) {
     placeNewClips();
     if (fresh) zoomFit();
     changed();
+    checkIntervals();
     if (!r.errors.length) $('#addDlg').close();
   } else if (!r.errors.length) $('#addErr').textContent = 'No new video files found.';
 }
@@ -1700,6 +1970,76 @@ document.addEventListener('click', (e) => {
   const btn = e.target.closest('button');
   if (btn && !btn.closest('dialog')) btn.blur();
 });
+
+// ------------------------------------------------------------------ music generation (ACE-Step)
+
+const GEN_IDEAS = {
+  'Synthwave': 'synthwave, retro synths, driving drums, building energy, futuristic robot workshop',
+  'Electronic': 'upbeat electronic, punchy beat, bright synth arpeggios, positive and energetic',
+  'Lo-fi': 'lo-fi hip hop, mellow keys, soft vinyl crackle, relaxed steady groove',
+  'Cinematic': 'cinematic post-rock, slow build, swelling guitars and strings, epic finale',
+  'Funk': 'playful funk, slap bass, clavinet, tight drums, fun and bouncy',
+};
+function genDurations() {
+  const D = Math.max(10, outputSeconds()), v = $('#genCount').value;
+  const n = v === 'auto' ? Math.min(6, Math.max(1, Math.round(D / 240))) : parseInt(v, 10);
+  const each = Math.min(600, Math.max(10, D / n));
+  return Array.from({ length: n }, () => Math.round(each));
+}
+function renderGenPlan() {
+  const d = genDurations(), D = outputSeconds(), total = d.reduce((a, b) => a + b, 0);
+  $('#genPlan').textContent = `Video ${fmtDur(D)} → ${d.length} song${d.length > 1 ? 's' : ''} of ${fmtDur(d[0])}`
+    + (total + 1 < D ? ` (${fmtDur(total)}, loops to fill)` : '') + '. They are added to the music list when ready.';
+}
+async function openGen() {
+  if (!$('#genPrompt').value) $('#genPrompt').value = GEN_IDEAS.Synthwave;
+  $('#genIdeas').innerHTML = '';
+  for (const [k, v] of Object.entries(GEN_IDEAS)) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'chip'; b.textContent = k;
+    b.onclick = () => { $('#genPrompt').value = v; };
+    $('#genIdeas').appendChild(b);
+  }
+  renderGenPlan();
+  genOpened = Date.now() / 1000;
+  $('#genBackend').textContent = 'Checking for ACE-Step…';
+  if (!(lastStatus.musicgen || {}).running) { $('#genStatus').textContent = ''; $('#genProgress').hidden = true; }
+  $('#genDlg').showModal();
+  const r = await api('/api/music/backend', {});
+  $('#genSpaceRow').hidden = r.local;
+  $('#genBackend').innerHTML = r.local
+    ? `✓ ACE-Step is running on this Mac (${r.url}). A 4-minute song takes about a minute.`
+    : `ACE-Step isn't running on this Mac (${r.url}). Start it in a terminal: <code>cd ~/GitHub/ACE-Step-1.5 && ./start_api_server_macos.sh</code>, then reopen this window.`;
+}
+$('#musicGenBtn').onclick = openGen;
+$('#genCount').onchange = renderGenPlan;
+$('#genStart').onclick = async () => {
+  const r = await api('/api/music/generate', {
+    prompt: $('#genPrompt').value, instrumental: $('#genInstr').checked,
+    durations: genDurations(), allowSpace: $('#genSpace').checked,
+  });
+  if (r.error) $('#genStatus').textContent = r.error;
+};
+$('#genCancel').onclick = () => api('/api/music/generate/cancel', {});
+let genWasRunning = false, genOpened = 0;
+async function renderGen(g) {
+  const running = !!g.running;
+  $('#genStart').hidden = running; $('#genCancel').hidden = !running;
+  if (g.step && (running || (g.started || 0) > genOpened - 5)) {   // not a finished run from before
+    $('#genProgress').hidden = false;
+    $('#genProgress > div').style.width = `${Math.round((g.progress || 0) * 100)}%`;
+    const el = Math.round(Date.now() / 1000 - (g.started || Date.now() / 1000));
+    $('#genStatus').textContent = g.error ? `Failed: ${g.error}`
+      : g.step === 'done' ? 'Done: the new music is in the Music panel.' : `Generating ${g.step} · ${fmtDur(el)} elapsed`;
+  }
+  if (genWasRunning && !running && g.step === 'done') {
+    const st = await api('/api/state');
+    S.music.tracks = st.state.music.tracks;
+    MUSIC_MISSING = new Set(st.musicMissing || []);
+    renderMusic(); scheduleSave();
+  }
+  genWasRunning = running;
+}
 
 // ------------------------------------------------------------------ export
 
@@ -1769,10 +2109,46 @@ async function poll() {
     }
     AN = st.analysis;
     setMissing(st.missing || []);
+    if (st.changes > CHANGES_SEEN) { CHANGES_SEEN = st.changes; filesReplaced(st.changed || []); }
     if (redraw) { drawDirty = true; if (ui.selClip) renderClipInfo(); }
     renderExport(st.export || {});
+    renderGen(st.musicgen || {});
+    renderTextScan(st.textscan || {});
   } catch (e) { /* server restarting */ }
   setTimeout(poll, 1000);
+}
+
+// Video files replaced in place (e.g. re-exported from Insta360 Studio): the server
+// re-reads them and redoes the analysis; reload them here and say what to check.
+let CHANGES_SEEN = 0;
+async function filesReplaced(events) {
+  const r = await api('/api/state');
+  const evs = [];
+  for (const c of r.state.clips) {
+    const mine = S.clips.find((x) => x.id === c.id);
+    if (!mine || (c.rev || 0) === (mine.rev || 0)) continue;
+    for (const k of ['duration', 'frames', 'width', 'height', 'size', 'mtime', 'fps', 'codec', 'rev', 'interval_guess']) mine[k] = c[k];
+    delete DIFFS[c.id]; delete ACT[c.id];
+    for (const k of [...THUMBS.keys()]) if (k.startsWith(c.id)) THUMBS.delete(k);
+    for (const v of Object.values(vids)) if (v._clip === c.id) v._clip = null;
+    const ev = [...events].reverse().find((e) => e.id === c.id) || {};
+    evs.push({ c, ev });
+  }
+  if (!evs.length) return;
+  AN = r.analysis;
+  changed(false);
+  const lines = evs.map(({ c, ev }) => {
+    const notes = [];
+    if (ev.framesBefore && ev.framesBefore !== ev.framesAfter) notes.push(`length changed: ${ev.framesBefore} → ${ev.framesAfter} frames, check its alignment`);
+    if (ev.sizeBefore && `${ev.sizeBefore}` !== `${ev.sizeAfter}`) notes.push(`size ${ev.sizeBefore.join('×')} → ${ev.sizeAfter.join('×')}`);
+    const nb = (S.blurs[c.id] || []).length;
+    if (nb) notes.push(`${nb} blur area(s): check they still cover the screen`);
+    return `${c.name}${notes.length ? '\n    ' + notes.join('\n    ') : ''}`;
+  });
+  $('#syncDlg h3').textContent = `${evs.length} video file${evs.length > 1 ? 's' : ''} replaced`;
+  $('#dlgHint').textContent = '';
+  $('#syncReport').textContent = `${lines.join('\n')}\n\nThe new version is used from now on and re-analysed; clip positions, cuts and layouts are kept.`;
+  if (!$('#syncDlg').open) $('#syncDlg').showModal();
 }
 
 function setMissing(ids) {
@@ -1842,6 +2218,7 @@ async function boot() {
   const r = await api('/api/state');
   S = r.state; AN = r.analysis; PROJECT_DIR = r.projectDir;
   setMissing(r.missing || []);
+  CHANGES_SEEN = r.changes || 0;
   S.cuts = normCuts(S.cuts || []);
   S.hidden = S.hidden || { A: [], B: [] };
   S.keeps = S.keeps || [];
@@ -1861,6 +2238,8 @@ async function boot() {
   }
   placeNewClips();
   zoomFit();
+  checkIntervals();
+  api('/api/textscan').then((t) => { if (t.hits) { TEXT = t; renderText(); } });
   $('#saveState').textContent = '';
   poll();
   requestAnimationFrame(tick);

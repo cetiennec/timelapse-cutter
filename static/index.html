@@ -45,6 +45,7 @@
         </div>
         <div class="stage-msg" id="msgA"></div>
         <div class="stage-msg" id="msgB"></div>
+        <svg class="blur-corners" id="blurCorners"></svg>
         <canvas class="stage-fade" id="fadeCanvas"></canvas>
         <div class="stage-cut" id="stageCut">CUT</div>
       </div>
@@ -92,6 +93,7 @@
       </div>
       <label class="check"><input type="checkbox" id="fill"> Crop to fill (no black bars)</label>
       <p class="hint">When only one camera has footage, it is shown full frame. Change the layout of one part in Edit below.</p>
+      <p class="warn" id="layoutOverrideInfo" hidden></p>
     </details>
 
     <details open>
@@ -117,7 +119,8 @@
     <details open>
       <summary>Music</summary>
       <div id="musicList" class="mlist"></div>
-      <div class="row wrap"><button id="musicAddBtn" class="btn">＋ Add music…</button></div>
+      <div class="row wrap"><button id="musicAddBtn" class="btn">＋ Add music…</button>
+        <button id="musicGenBtn" class="btn">✨ Generate music…</button></div>
       <p class="err" id="musicErr"></p>
       <label>Volume <input type="range" id="musVol" min="0" max="1" step="0.05"><output id="musVolOut"></output></label>
       <label>Start the music at <input type="range" id="musOffset" min="0" max="60" step="1"><output id="musOffsetOut"></output></label>
@@ -154,8 +157,28 @@
         <button id="unhideBtn" class="btn">Unhide</button>
       </div>
       <div class="row wrap">
+        <button id="clearLayoutsBtn" class="btn small" title="Remove every per-part layout: the default layout applies everywhere">Reset all parts to the default layout</button>
+      </div>
+      <div class="row wrap">
         <button id="autoBlurBtn" class="btn" title="Find computer, laptop and phone screens in the selected part (or clip) and blur them there">▭ Blur screens here (auto)</button>
       </div>
+    </details>
+
+    <details open id="textPanel">
+      <summary>Readable text</summary>
+      <p class="hint">Reads the text visible in the kept parts (or the selected part) at the size each camera has in the export, and flags what looks private: passwords, keys, emails, phone numbers, addresses. Text already under a blur area is left out.</p>
+      <div class="row wrap">
+        <button id="textScanBtn" class="btn" title="Read the text in frames of the kept parts (or the selected part)">🔍 Check for readable text</button>
+        <button id="textCancelBtn" class="btn small" hidden>Cancel</button>
+        <label class="inline small">every <select id="textEvery"><option value="0.5">0.5 s</option><option value="1" selected>1 s</option><option value="2">2 s</option><option value="5">5 s</option></select> of video</label>
+      </div>
+      <div class="progress" id="textProgress" hidden><div></div></div>
+      <p class="hint" id="textInfo"></p>
+      <div class="row wrap" id="textTools" hidden>
+        <button id="textBlurAll" class="btn small">▭ Blur all private ones</button>
+        <label class="check small"><input type="checkbox" id="textAll"> Show labels and numbers</label>
+      </div>
+      <div class="mlist tlist" id="textList"></div>
     </details>
 
     <details open id="clipPanel">
@@ -190,12 +213,48 @@
   </form>
 </dialog>
 
+<dialog id="intervalDlg">
+  <form method="dialog">
+    <h3>Clips shot at another photo interval</h3>
+    <p class="hint">The timeline assumes one photo every <span id="ivProject"></span> s. From their file dates, these clips were shot at another interval, so next to the other camera they run too fast or too slow:</p>
+    <pre id="ivReport" class="report"></pre>
+    <p class="hint">Stretching keeps both cameras in time (each photo is held longer), then puts the clips back in sync from their footage. ⌘Z undoes it; the interval can be changed in the Clip panel.</p>
+    <div class="row end"><button value="later" class="btn">Not now</button><button value="apply" class="btn primary" id="ivApply">Stretch them</button></div>
+  </form>
+</dialog>
+
 <dialog id="syncDlg">
   <form method="dialog">
     <h3>Sync from footage</h3>
     <pre id="syncReport" class="report"></pre>
     <p class="hint" id="dlgHint"></p>
     <div class="row end"><button value="close" class="btn primary">OK</button></div>
+  </form>
+</dialog>
+
+<dialog id="genDlg">
+  <form method="dialog">
+    <h3>Generate music</h3>
+    <label>Describe the music
+      <textarea id="genPrompt" rows="3" spellcheck="false"></textarea></label>
+    <div class="row wrap" id="genIdeas"></div>
+    <label class="check"><input type="checkbox" id="genInstr" checked> Instrumental (no vocals)</label>
+    <label>Songs
+      <select id="genCount">
+        <option value="auto">Fill the whole video, new song every ~4 min</option>
+        <option value="1">One song (loops if shorter than the video)</option>
+        <option value="2">2 songs</option><option value="3">3 songs</option><option value="4">4 songs</option>
+      </select></label>
+    <p class="hint" id="genPlan"></p>
+    <p class="hint" id="genBackend"></p>
+    <label class="check" id="genSpaceRow" hidden><input type="checkbox" id="genSpace"> Use the online ACE-Step Space instead (slower, often busy)</label>
+    <div class="progress" id="genProgress" hidden><div></div></div>
+    <p class="hint" id="genStatus"></p>
+    <div class="row end">
+      <button value="cancel" class="btn">Close</button>
+      <button type="button" class="btn" id="genCancel" hidden>Stop</button>
+      <button type="button" class="btn primary" id="genStart">Generate</button>
+    </div>
   </form>
 </dialog>
 

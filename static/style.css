@@ -131,8 +131,24 @@ dialog textarea { font-family: ui-monospace, Menlo, monospace; font-size: 12px; 
 .stage-blur { position: absolute; pointer-events: none; background: rgba(128,128,128,0.08); }
 .stage-blur.sel { outline: 1px dashed rgba(255,214,10,0.9); }
 .stage-blur.drawing { outline: 2px solid #ffd60a; }
+.blur-corners { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 15; pointer-events: none; overflow: visible; }
+.blur-corners polygon { fill: none; stroke: rgba(255,214,10,0.9); stroke-width: 1; stroke-dasharray: 4 3; }
+.blur-corners circle { fill: #ffd60a; stroke: #000; stroke-width: 1; pointer-events: all; cursor: move; }
+.blur-corners circle:hover { r: 7; }
 .stage.drawing, .stage.drawing video { cursor: crosshair; }
 .blurbox { margin: 10px 0 4px; padding-top: 8px; border-top: 1px solid var(--line); }
 .blurhead { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font-size: 12px; }
 .chip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 0 7px; font-size: 11px; cursor: pointer; color: var(--muted); }
 .chip:hover { color: var(--text); border-color: #4a4f57; }
+dialog code { font: 11px ui-monospace, Menlo, monospace; background: var(--bg); padding: 1px 4px; border-radius: 4px; user-select: text; -webkit-user-select: text; }
+dialog .check { display: flex; gap: 6px; align-items: center; grid-template-columns: none; }
+.warn { color: #ffcf6b; font-size: 12px; margin: 6px 0; }
+.tlist { max-height: 320px; overflow: auto; }
+.tlist .mrow { cursor: pointer; }
+.tlist .mrow.on { outline: 1px solid #ff5a6a; }
+.tlist .tkind { font-size: 10px; padding: 0 5px; border-radius: 8px; background: var(--bg); color: var(--muted); white-space: nowrap; }
+.tlist .private .tkind { background: #5a1f27; color: #ffb3bc; }
+.tlist .mname { user-select: text; -webkit-user-select: text; }
+.blur-corners rect.textmark { fill: none; stroke: #ff5a6a; stroke-width: 2; }
+label.inline { display: inline-flex; gap: 4px; align-items: center; margin: 0; color: var(--muted); }
+.inspector label.inline > select { width: auto; }
