@@ -34,6 +34,9 @@ const api = async (path, body) => {
 };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const fps = () => S.settings.fps || 30;
+// The export's frame rate can be higher than the footage's: at 60 fps a part sped up 2×
+// still shows every photo. Timeline times stay in seconds of footage (fps()).
+const outFps = () => S.output.fps || fps();
 const ratio = () => (S.settings.interval || 2) * fps();
 const frameRound = (t) => Math.round(t * fps()) / fps();
 
@@ -102,8 +105,37 @@ function layoutAt(t) {
   const o = S.overrides.find((r) => t >= r.start && t < r.end);
   return o ? { ...S.layout, mode: o.mode, ...(o.main ? { main: o.main } : {}) } : S.layout;
 }
-// Parts can be sped up ("Speed here"), on top of the export's overall speed.
-const speedAt = (t) => (S.speeds.find((r) => t >= r.start && t < r.end) || {}).speed || 1;
+// Parts can be sped up ("Speed here"), on top of the export's overall speed. Where the speed
+// changes, it ramps linearly over S.settings.speedRamp seconds of footage (centred on the
+// change, shorter when two changes are close) instead of jumping.
+const partSpeedAt = (t) => (S.speeds.find((r) => t >= r.start && t < r.end) || {}).speed || 1;
+let rampCache = null, rampFor = null;
+function speedRamps() {
+  const R = S.settings.speedRamp ?? 3, key = JSON.stringify([S.speeds, R]);
+  if (rampFor === key) return rampCache;
+  const pts = [...new Set(S.speeds.flatMap((r) => [r.start, r.end]))].sort((a, b) => a - b)
+    .filter((c) => Math.abs(partSpeedAt(c - 1e-6) - partSpeedAt(c + 1e-6)) > 1e-9);
+  rampCache = pts.map((c, i) => {
+    const h = Math.min(R / 2, i ? (c - pts[i - 1]) / 2 : R / 2, i + 1 < pts.length ? (pts[i + 1] - c) / 2 : R / 2);
+    return { a: c - h, b: c + h, s0: partSpeedAt(c - 1e-6), s1: partSpeedAt(c + 1e-6) };
+  }).filter((r) => r.b - r.a > 1e-3);
+  rampFor = key;
+  return rampCache;
+}
+function speedAt(t) {
+  for (const r of speedRamps()) if (t > r.a && t < r.b) return r.s0 + ((r.s1 - r.s0) * (t - r.a)) / (r.b - r.a);
+  return partSpeedAt(t);
+}
+// Within a segment the speed goes linearly from sp0 to sp1: output seconds after x seconds
+// of footage into it, and the reverse.
+function segOut(sg, x) {
+  const d = sg.sp1 - sg.sp0;
+  return Math.abs(d) < 1e-9 ? x / sg.sp0 : (sg.dur / d) * Math.log(1 + (d * x) / (sg.dur * sg.sp0));
+}
+function segIn(sg, y) {
+  const d = sg.sp1 - sg.sp0;
+  return Math.abs(d) < 1e-9 ? y * sg.sp0 : ((sg.dur * sg.sp0) / d) * (Math.exp((y * d) / sg.dur) - 1);
+}
 const layoutLabel = (o) => ({ pip: `PiP ${o.main} main`, sbs: 'side by side', stack: 'stacked', blend: 'superpose', A: 'A only', B: 'B only' })[o.mode];
 
 function changed(redetect = true) {
@@ -153,6 +185,7 @@ function segments() {
   for (const tr of TRACKS) for (const h of S.hidden[tr] || []) { bps.add(h.start); bps.add(h.end); }
   for (const o of S.overrides) { bps.add(o.start); bps.add(o.end); }
   for (const o of S.speeds) { bps.add(o.start); bps.add(o.end); }
+  for (const r of speedRamps()) { bps.add(r.a); bps.add(r.b); }
   for (const bs of Object.values(S.blurs || {})) for (const b of bs) if (b.start != null) { bps.add(b.start); bps.add(b.end); }
   const sorted = [...bps].sort((a, b) => a - b);
   const segs = [];
@@ -165,18 +198,20 @@ function segments() {
       const m = (s0 + s1) / 2;
       const ca = coverage('A', m), cb = coverage('B', m);
       if (!ca && !cb) continue;
-      segs.push({
+      const os = S.output.speed || 1, sp0 = speedAt(s0 + 1e-7) * os, sp1 = speedAt(s1 - 1e-7) * os;
+      const od = Math.abs(sp1 - sp0) < 1e-9 ? (s1 - s0) / sp0 : ((s1 - s0) * Math.log(sp1 / sp0)) / (sp1 - sp0);
+      segs.push({ sp0, sp1,
         start: s0, end: s1, dur: s1 - s0,
         a: ca ? { clip: ca.id, t: srcT(ca, s0), stretch: stretch(ca) } : null,
         b: cb ? { clip: cb.id, t: srcT(cb, s0), stretch: stretch(cb) } : null,
-        layout: layoutAt(m), speed: speedAt(m) * (S.output.speed || 1),
+        layout: layoutAt(m), speed: (s1 - s0) / od,   // its average speed
         blur: { a: blursAt(ca, m).map(boxOnly), b: blursAt(cb, m).map(boxOnly) },
       });
     }
   }
   // Output length in frames, and the cross-dissolve with the previous piece:
   // "session" when a camera switches to another clip, "cut" when time jumps.
-  const f = fps(), T = S.transitions || { session: 0, cut: 0 };
+  const f = outFps(), T = S.transitions || { session: 0, cut: 0 }, k = f / fps();   // dissolves are set in footage frames
   for (const sg of segs) sg.frames = Math.round((sg.dur * f) / sg.speed);
   const out = segs.filter((sg) => sg.frames >= 1);
   out.forEach((sg, i) => {
@@ -186,13 +221,13 @@ function segments() {
     const session = ['a', 'b'].some((k) => p[k] && sg[k] && p[k].clip !== sg[k].clip);
     const relayout = p.layout.mode !== sg.layout.mode || p.layout.main !== sg.layout.main;
     sg.kind = session ? 'session' : Math.abs(p.end - sg.start) > 1e-6 ? 'cut' : relayout ? 'layout' : null;
-    const want = sg.kind === 'session' ? T.session : T.cut;   // layout changes use the "cut" length
+    const want = Math.round((sg.kind === 'session' ? T.session : T.cut) * k);   // layout changes use the "cut" length
     if (sg.kind) sg.fade = Math.max(0, Math.min(want || 0, Math.floor(p.frames / 2), Math.floor(sg.frames / 2)));
   });
   return (segCache = out);
 }
 
-const outputSeconds = () => segments().reduce((a, sg) => a + sg.frames - sg.fade, 0) / fps();
+const outputSeconds = () => segments().reduce((a, sg) => a + sg.frames - sg.fade, 0) / outFps();
 
 function updateStats() {
   const segs = segments();
@@ -203,7 +238,7 @@ function updateStats() {
   if (S.music) renderMusic();
   renderOverrideInfo();
   $('#stats').innerHTML = S.clips.length
-    ? `Timeline <b>${fmtDur(total)}</b> (${fmtReal(total)} real) → output <b>${fmtDur(outputSeconds())}</b>
+    ? `Timeline <b>${fmtDur(total)}</b> (${fmtReal(total)} real) → output <b>${fmtDur(totalSeconds())}</b>${introLen() + endLen() ? ` <span class="muted">(with ${introLen() + endLen()} s opening/end card)</span>` : ''}
        · cut ${total ? Math.round(100 * (1 - kept / total)) : 0}%`
     : '';
 }
@@ -232,19 +267,44 @@ function pushUndo(snap = snapshot()) {
 function undo() { if (undoStack.length) { redoStack.push(snapshot()); restore(undoStack.pop()); } }
 function redo() { if (redoStack.length) { undoStack.push(snapshot()); restore(redoStack.pop()); } }
 
-let saveTimer = null;
+let saveTimer = null, REV = 0;
 function scheduleSave() {
   $('#saveState').textContent = 'Saving…';
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
-    await api('/api/state', {
+    const r = await api('/api/state', {
       clips: S.clips.map((c) => ({ id: c.id, start: c.start, track: c.track, interval: c.interval || null })),
       cuts: S.cuts, keeps: S.keeps, hidden: S.hidden, layout: S.layout, detect: S.detect,
       transitions: S.transitions, splits: S.splits, overrides: S.overrides, speeds: S.speeds,
       output: S.output, settings: S.settings, tracks: S.tracks, music: S.music, blurs: S.blurs, titles: S.titles,
     });
+    if (r.rev) REV = r.rev;
+    saveTimer = null;
     $('#saveState').textContent = 'Saved';
   }, 500);
+}
+
+// Another page (another tab, or Claude driving the app) saved an edit: take it, so the
+// two don't overwrite each other's changes.
+const SHARED = ['cuts', 'keeps', 'splits', 'overrides', 'speeds', 'hidden', 'layout', 'detect', 'transitions',
+  'output', 'settings', 'tracks', 'music', 'blurs', 'titles'];
+async function reloadState() {
+  const r = await api('/api/state');
+  if (saveTimer) return;   // an edit of ours is about to be saved
+  for (const k of SHARED) if (k in r.state) S[k] = r.state[k];
+  const byId = new Map(r.state.clips.map((c) => [c.id, c]));
+  for (const c of S.clips) {
+    const n = byId.get(c.id);
+    if (n) Object.assign(c, { start: n.start, track: n.track, interval: n.interval || null });
+  }
+  S.cuts = normCuts(S.cuts || []);
+  REV = r.rev;
+  segCache = null; viewMap = null; drawDirty = true;
+  renderTrackNames(); renderMusic(); renderLayout(); renderDetect(); renderTitles(); renderBlurStrength();
+  renderAutoSpeed(); renderOverrideInfo(); updateSelInfo(); updateStats();
+  if (ui.selClip) renderClipInfo();
+  if (TEXT) renderText();
+  $('#saveState').textContent = 'Updated from another window';
 }
 
 // ------------------------------------------------------------------ analysis data
@@ -394,7 +454,7 @@ function layoutBlurs(ca, cb) {
     const v = vids[tr];
     if (!c || v.style.display !== 'block') continue;
     const pr = pictureRect(v, c), z = (parseInt(v.style.zIndex, 10) || 0) + 1;
-    const k = S.settings.blurStrength ?? 1, radius = k > 0 ? Math.max(1, 0.02 * pr.h * k) : 0;
+    const k = S.settings.blurStrength ?? 1, radius = 0.02 * pr.h * k;   // 100% ≈ 22 px of blur at 1080p
     for (const b of blursAt(c, ui.t)) { const r = boxRect(pr, b); if (r) box(r, z, radius, 'stage-blur', b.pts, pr); }
     const d = ui.blurDraw;
     if (d && d.clip === c.id && d.box) { const r = boxRect(pr, d.box); if (r) box(r, z, radius, 'stage-blur drawing'); }
@@ -492,18 +552,22 @@ function layoutVideos(ca, cb) {
   }
 }
 
-function syncVideo(tr, clip) {
+let PROXIES = {};   // clip id -> state of its light preview copy ("ready" = play that)
+function syncVideo(tr, clip, shown = true) {
   const v = vids[tr];
   if (!clip) { if (!v.paused) v.pause(); return; }
+  const src = `/media/${clip.id}?v=${clip.rev || 0}${PROXIES[clip.id] === 'ready' ? '&proxy=1' : ''}`;
+  if (v._clip === clip.id && v._src !== src && !ui.playing) v._clip = null;   // its preview copy is ready
   if (v._clip !== clip.id) {
     // Switching files blanks the element until the new one is decoded: freeze the
     // current picture on top meanwhile instead of flashing black.
     if (v.style.display === 'block' && v.readyState >= 2) startFade(0, true);
-    v._clip = clip.id; v._ready = false;
-    v.src = `/media/${clip.id}${clip.rev ? `?v=${clip.rev}` : ''}`;
+    v._clip = clip.id; v._ready = false; v._src = src;
+    v.src = src;
     v.onloadedmetadata = () => { v._ready = true; };
   }
   if (!v._ready) return;
+  if (!shown) { if (!v.paused) v.pause(); return; }   // not on screen: don't spend decoding on it
   const want = clamp(srcT(clip, ui.t), 0, Math.max(0, (v.duration || clip.duration) - 0.001));
   const speed = (ui.speed * speedAt(ui.t)) / stretch(clip);
   if (ui.playing) {
@@ -535,7 +599,8 @@ function tick(now) {
   ui.lastFrame = now;
   if (S) {
     const before = ui.t;
-    if (ui.playing) {
+    const segsNow = segments(), lastEnd = segsNow.length ? segsNow[segsNow.length - 1].end : timelineEnd();
+    if (ui.playing && !ui.book) {
       // Follow a playing video's own clock when possible (smooth, no drift);
       // fall back to wall-clock time over gaps, cuts and while loading.
       const sp = ui.speed * speedAt(ui.t);
@@ -547,6 +612,9 @@ function tick(now) {
           if (vt >= ui.t - 0.05 && vt <= ui.t + 0.5 * sp) { next = Math.max(ui.t, vt); break; }
         }
       }
+      // With music playing, the music is the clock (smooth sound); the videos follow it.
+      const mc = musicClock(), o = mc == null ? null : outAt(ui.t);
+      if (mc != null && o != null && Math.abs(mc - o) < 1.5 && mc >= o - 0.05) next = timelineAt(mc);
       ui.t = next;
       if (ui.skipCuts || ui.compact) {
         for (let k = 0; k < 4; k++) {
@@ -560,7 +628,9 @@ function tick(now) {
           break;
         }
       }
-      if (ui.t >= timelineEnd()) { ui.t = timelineEnd(); setPlaying(false); }
+      if (endLen() && !ui.endShown && segsNow.length && ui.t >= lastEnd - 1e-3) {   // the end card comes after the last kept moment
+        ui.t = Math.min(ui.t, lastEnd); ui.endShown = true; playBookend('endcard');
+      } else if (ui.t >= timelineEnd()) { ui.t = timelineEnd(); setPlaying(false); }
       maybeDissolve(before, ui.t);
       followPlayhead();
     }
@@ -575,7 +645,9 @@ function tick(now) {
       if (p >= 1) stopFade(); else fadeCv.style.opacity = 1 - p;
     }
     const ca = coverage('A', ui.t), cb = coverage('B', ui.t);
-    syncVideo('A', ca); syncVideo('B', cb); syncMusic();
+    const L = layoutAt(ui.t), solo = ui.blurDraw ? ui.blurDraw.track
+      : (L.mode === 'A' || L.mode === 'B') && (L.mode === 'A' ? ca : cb) ? L.mode : null;
+    syncVideo('A', ca, !ui.book && (!solo || solo === 'A')); syncVideo('B', cb, !ui.book && (!solo || solo === 'B')); syncMusic();
     layoutStage(ca, cb);
     const ov = rangeAt(S.overrides, ui.t);
     if (ov !== ui.lastOv) { ui.lastOv = ov; renderOverrideInfo(); }
@@ -657,56 +729,151 @@ function outAt(t) {
   }
   const i = segIndexAt(t);
   if (i < 0) return null;
-  return (outCache[i] + ((t - segs[i].start) * fps()) / segs[i].speed) / fps();
+  return outCache[i] / outFps() + segOut(segs[i], t - segs[i].start);
 }
 
 // Soundtrack: which song plays at output time o, and how loud (same rules as the export).
 const mus = new Audio();
 mus.preload = 'auto';
+// Songs play back to back, each cross-fading into the next over `crossfade` seconds (as the
+// export does): song i starts at the sum of the previous lengths minus one crossfade each.
+const xfadeLen = () => (S.music.tracks.length > 1 ? Math.max(0, S.music.crossfade ?? 3) : 0);
 function musicAt(o) {
-  const M = S.music, total = M.tracks.reduce((n, t) => n + t.duration, 0);
-  if (!total) return null;
-  let x = o + (M.offset || 0);
-  if (M.loop) x %= total; else if (x >= total) return null;
-  for (const t of M.tracks) { if (x < t.duration) return { track: t, t: x }; x -= t.duration; }
-  return null;
+  const M = S.music, X = xfadeLen();
+  const period = M.tracks.reduce((n, t) => n + t.duration - X, 0);
+  if (period <= 0) return null;
+  const raw = o + (M.offset || 0);
+  let x = raw;
+  if (M.loop) x = ((x % period) + period) % period; else if (x >= period + X) return null;
+  const end = M.tracks[M.tracks.length - 1];
+  if (M.loop && raw >= period && x < X / 2) {   // the last song still ending over the first one
+    const t = end.duration - X + x;
+    return { track: end, t, o0: o - t };
+  }
+  // in an overlap, switch to the next song halfway (one audio element in the preview)
+  let at = 0;
+  for (const t of M.tracks) {
+    if (t === end || x < at + t.duration - X / 2) return { track: t, t: x - at, o0: o - (x - at) };
+    at += t.duration - X;
+  }
 }
-function musicGain(o) {
-  const M = S.music, D = outputSeconds();
+function musicGain(o, m) {
+  const M = S.music, D = totalSeconds(), X = xfadeLen();
   let g = M.volume;
   if (M.fadeIn > 0 && o < M.fadeIn) g *= o / M.fadeIn;
   if (M.fadeOut > 0 && o > D - M.fadeOut) g *= Math.max(0, (D - o) / M.fadeOut);
+  if (X && m) {   // linear crossfade: at the switch halfway, both songs are at half volume
+    const last = !M.loop && m.track === M.tracks[M.tracks.length - 1];
+    if (m.o0 > 1e-3) g *= Math.min(1, m.t / X);
+    if (!last) g *= Math.min(1, (m.track.duration - m.t) / X);
+  }
   return clamp(g, 0, 1);
 }
+// Output time from the playing song, or null when it can't lead (loading, seeking).
+function musicClock() {
+  if (ui.book || !ui.playing || ui.muted || mus.paused || mus.seeking || mus.readyState < 3 || mus._o0 == null) return null;
+  return mus._o0 + mus.currentTime - introLen();
+}
 function syncMusic() {
-  const o = ui.playing && !ui.muted ? outAt(ui.t) : null;
+  const bv = $('#vBook'), inBook = ui.book && !ui.book.loading;
+  const o0 = ui.playing && !ui.muted ? (inBook ? 0 : outAt(ui.t)) : null;
+  // the export's music starts with the opening sequence
+  const o = o0 == null ? null : inBook ? (ui.book.which === 'intro' ? 0 : introLen() + outputSeconds()) + bv.currentTime : o0 + introLen();
   const m = o == null ? null : musicAt(o);
-  if (!m || MUSIC_MISSING.has(m.track.id)) { if (!mus.paused) mus.pause(); return; }
-  if (mus._id !== m.track.id) { mus._id = m.track.id; mus.src = `/audio/${m.track.id}`; mus.currentTime = m.t; }
-  // The preview shows dissolves without overlapping the pieces, so it drifts a little
-  // from the export's timing: nudge the rate, jump only when far off.
-  const drift = mus.currentTime - m.t;
-  if (Math.abs(drift) > 1 || (mus.paused && Math.abs(drift) > 0.1)) mus.currentTime = m.t;
-  mus.playbackRate = ui.speed * clamp(1 - drift * 0.5, 0.9, 1.1);
-  mus.volume = musicGain(o);
+  if (!m || MUSIC_MISSING.has(m.track.id)) { if (!mus.paused) mus.pause(); mus._o0 = null; return; }
+  if (mus._id !== m.track.id) {
+    mus._id = m.track.id; mus._o0 = null;
+    mus.src = `/audio/${m.track.id}`;
+    mus.onloadedmetadata = () => { mus.currentTime = Math.max(0, m.t); mus._o0 = m.o0; };
+  } else if (mus._o0 != null) {
+    // The music leads the preview (see tick): it is only moved when far off, after a
+    // seek or a long stall, never nudged, so it plays smoothly.
+    if (Math.abs(mus._o0 + mus.currentTime - o) > 1.5) { mus.currentTime = Math.max(0, m.t); mus._o0 = m.o0; }
+  }
+  mus.playbackRate = ui.speed;
+  mus.volume = musicGain(o, m);
   if (mus.paused) mus.play().catch(() => {});
+}
+
+// Master time at output time o (the inverse of outAt).
+function timelineAt(o) {
+  const segs = segments();
+  if (!segs.length) return 0;
+  outAt(segs[0].start);   // fills outCache
+  const f = outFps(), F = o * f;
+  let i = 0;
+  while (i + 1 < segs.length && outCache[i + 1] <= F) i++;
+  const sg = segs[i];
+  return Math.min(sg.end - 1e-6, sg.start + segIn(sg, Math.max(0, F - outCache[i]) / f));
 }
 
 function maybeDissolve(t0, t1) {
   const i1 = segIndexAt(t1);
   if (i1 <= 0 || i1 === segIndexAt(t0)) return;
   const sg = segments()[i1];
-  if (sg.fade) startFade(((sg.fade / fps()) * (S.output.speed || 1)) / ui.speed);
+  if (sg.fade) startFade(((sg.fade / outFps()) * sg.speed) / ui.speed);
 }
 
 function setPlaying(p) {
-  if (p && ui.t >= timelineEnd() - 1e-3) ui.t = 0;
+  if (p && ui.t >= timelineEnd() - 1e-3) { ui.t = 0; ui.endShown = false; }
   ui.playing = p;
   $('#playBtn').textContent = p ? '❚❚' : '▶';
   if (!p) for (const v of Object.values(vids)) v.pause();
+  if (ui.book) { const v = $('#vBook'); if (p && !ui.book.loading) v.play().catch(() => {}); else if (!p) v.pause(); }
+  else if (p && introLen() && segments().length && ui.t <= segments()[0].start + 0.05) playBookend('intro');
 }
 
-function seek(t) { ui.t = clamp(t, 0, timelineEnd()); stopFade(); }
+function seek(t) { ui.t = clamp(t, 0, timelineEnd()); stopFade(); stopBookend(); ui.endShown = false; }
+
+// The opening sequence and the end card in the preview: rendered by the server (again when
+// their settings change), played over the stage before the first kept moment and after the
+// last one, with the music running through.
+const BOOK = { intro: {}, endcard: {} };
+function bookendUrl(which) {
+  const spec = which === 'intro' ? openingSpec() : endcardSpec();
+  const key = JSON.stringify([spec, S.output.width, S.output.height, outFps(), S.music, which === 'intro' ? 0 : Math.round(introLen() + outputSeconds())]);
+  const b = BOOK[which];
+  if (b.key === key && b.url) return Promise.resolve(b.url);
+  if (b.pending && b.pendingKey === key) return b.pending;
+  b.pendingKey = key;
+  b.pending = api('/api/bookend_preview', { which, spec, width: S.output.width, height: S.output.height, fps: outFps(),
+    musicAt: which === 'intro' ? 0 : introLen() + outputSeconds() })
+    .then((r) => {
+      if (b.pendingKey === key) b.pending = null;
+      if (r.error) throw new Error(r.error);
+      b.key = key; b.url = r.url;
+      return r.url;
+    });
+  return b.pending;
+}
+let bookTimer = null;
+function prepareBookends() {   // render them ahead, so play starts at once
+  clearTimeout(bookTimer);
+  bookTimer = setTimeout(() => {
+    if (introLen()) bookendUrl('intro').catch(() => {});
+    if (endLen()) bookendUrl('endcard').catch(() => {});
+  }, 2000);
+}
+function playBookend(which) {
+  const box = $('#stageBook'), v = $('#vBook');
+  ui.book = { which, loading: true };
+  box.hidden = false; v.style.opacity = 0;
+  $('#bookMsg').textContent = which === 'intro' ? 'Preparing the opening…' : 'Preparing the end card…';
+  bookendUrl(which).then((url) => {
+    if (!ui.book || ui.book.which !== which) return;
+    ui.book.loading = false; $('#bookMsg').textContent = '';
+    v.onended = () => { const w = ui.book && ui.book.which; stopBookend(); if (w === 'endcard') setPlaying(false); };
+    v.oncanplay = () => { v.style.opacity = 1; };
+    v.src = url; v.currentTime = 0;
+    if (ui.playing) v.play().catch(() => {});
+  }).catch((e) => { $('#bookMsg').textContent = `Could not render it: ${e.message}`; setTimeout(stopBookend, 2500); });
+}
+function stopBookend() {
+  if (!ui.book) return;
+  ui.book = null;
+  const v = $('#vBook');
+  v.pause(); v.onended = null; $('#stageBook').hidden = true;
+}
 
 function followPlayhead() {
   const w = canvas.clientWidth - LABEL_W;
@@ -811,9 +978,11 @@ function resizeCanvas() {
 }
 
 function zoomFit() {
-  const w = canvas.clientWidth - LABEL_W - 20;
+  // room on both sides for the opening and end card blocks of the Output row
+  const room = S && S.titles ? [introLen() ? 100 : 0, endLen() ? 100 : 20] : [0, 20];
+  const w = canvas.clientWidth - LABEL_W - room[0] - room[1];
   ui.view.pps = Math.max(0.05, w / viewEnd());
-  ui.view.start = 0;
+  ui.view.start = -room[0] / ui.view.pps;
   drawDirty = true;
 }
 function zoomAt(factor, x) {
@@ -916,6 +1085,22 @@ function drawBase() {
     if (x1 - x0 > 24) {
       g.save(); g.beginPath(); g.rect(x0, oy, x1 - x0, OUT_H); g.clip();
       g.fillStyle = '#111'; g.fillText(`${o.speed}×`, x1 - 22, oy + OUT_H - 4); g.restore();
+    }
+  }
+  // the opening sequence before the first kept moment, the end card after the last one
+  ui.bookBadges = [];
+  const segsB = segments();
+  if (segsB.length) {
+    g.font = '600 10px -apple-system';
+    for (const [which, len, t] of [['intro', introLen(), segsB[0].start], ['endcard', endLen(), segsB[segsB.length - 1].end]]) {
+      if (!len) continue;
+      const label = `${which === 'intro' ? '▶ Opening' : 'End card ▶'} ${len} s`, w = g.measureText(label).width + 12;
+      let x = which === 'intro' ? xOf(t) - w - 2 : xOf(t) + 2;
+      if (x + w < LABEL_W || x > W) continue;
+      x = Math.max(LABEL_W, x);
+      g.fillStyle = '#f26a21'; g.beginPath(); g.roundRect(x, oy + 1, w, OUT_H - 2, 4); g.fill();
+      g.fillStyle = '#16151a'; g.fillText(label, x + 6, oy + OUT_H - 4);
+      ui.bookBadges.push({ which, x0: x, x1: x + w });
     }
   }
   for (const s of segments()) {
@@ -1111,6 +1296,57 @@ function cutEdgeAt(x, y) {
   }
   return null;
 }
+// A speed part on the Output row: its edge (drag to extend or shorten it) or its middle
+// (drag to move it, click to select it).
+function speedPartAt(x, y) {
+  if (y < OUT_Y() - 2 || y > OUT_Y() + OUT_H + 2) return null;
+  for (let i = 0; i < S.speeds.length; i++) {
+    const r = S.speeds[i], x0 = xOf(r.start), x1 = xOf(r.end);
+    if (Math.abs(x - x0) < 5) return { i, side: 'start' };
+    if (Math.abs(x - x1) < 5) return { i, side: 'end' };
+  }
+  const i = rangeAt(S.speeds, tOf(x));
+  return i >= 0 ? { i, side: 'move' } : null;
+}
+// Clicking a speed part opens a small menu there to change its speed.
+const MENU_SPEEDS = [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 6, 8];
+function openSpeedMenu(r, x, y) {
+  const m = $('#speedMenu');
+  const set = (v) => {
+    pushUndo();
+    if (v === 1) S.speeds = S.speeds.filter((o) => o !== r);
+    else { r.speed = v; r.auto = false; }
+    m.hidden = true;
+    changed(false); renderMusic(); renderAutoSpeed(); updateSelInfo();
+  };
+  const i = MENU_SPEEDS.indexOf(r.speed);
+  m.innerHTML = `<div class="smhead">${fmtVideo(r.start)} → ${fmtVideo(r.end)}</div>
+    <div class="smrow"><button data-step="-1" title="Slower">−</button><span>${r.speed}×</span><button data-step="1" title="Faster">+</button></div>
+    <div class="smgrid">${MENU_SPEEDS.map((v) => `<button data-v="${v}" class="${v === r.speed ? 'on' : ''}">${v === 1 ? 'Normal' : `${v}×`}</button>`).join('')}</div>`;
+  m.onclick = (ev) => {
+    const b = ev.target.closest('button');
+    if (!b) return;
+    if (b.dataset.v) set(parseFloat(b.dataset.v));
+    else {
+      const j = clamp((i < 0 ? MENU_SPEEDS.findIndex((v) => v > r.speed) - (b.dataset.step < 0 ? 1 : 0) : i + +b.dataset.step), 0, MENU_SPEEDS.length - 1);
+      set(MENU_SPEEDS[j]);
+      if (MENU_SPEEDS[j] !== 1) openSpeedMenu(r, x, y);   // keep it open to step again
+    }
+  };
+  m.hidden = false;
+  m.style.left = `${Math.min(x, window.innerWidth - m.offsetWidth - 8)}px`;
+  m.style.top = `${Math.max(8, y - m.offsetHeight - 10)}px`;
+}
+document.addEventListener('mousedown', (e) => { if (!e.target.closest('#speedMenu')) $('#speedMenu').hidden = true; });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#speedMenu').hidden = true; });
+
+// After a speed part was moved or resized: it wins over the parts it now covers, and it is
+// the user's (a new Auto speed run keeps it).
+function settleSpeedPart(r) {
+  r.auto = false;
+  S.speeds = [...subtractRange(S.speeds.filter((x) => x !== r), r.start, r.end), r]
+    .filter((x) => x.end - x.start > 0.5 / fps()).sort((a, b) => a.start - b.start);
+}
 
 canvas.addEventListener('mousedown', (e) => {
   if (!S) return;
@@ -1123,9 +1359,22 @@ canvas.addEventListener('mousedown', (e) => {
     }
     return;
   }
+  const badge = y >= OUT_Y() - 2 && y <= OUT_Y() + OUT_H + 2 && (ui.bookBadges || []).find((b) => x >= b.x0 && x <= b.x1);
+  if (badge) {   // play the opening or the end card in the preview
+    const segs = segments();
+    seek(badge.which === 'intro' ? segs[0].start : segs[segs.length - 1].end);
+    if (badge.which === 'endcard') ui.endShown = true;
+    ui.playing = true; $('#playBtn').textContent = '❚❚';
+    playBookend(badge.which);
+    return;
+  }
   const t = tOf(x);
   const edge = cutEdgeAt(x, y);
-  if (edge) {
+  const spd = !edge && speedPartAt(x, y);
+  if (spd) {
+    const r = S.speeds[spd.i];
+    drag = { kind: 'speed', side: spd.side, r, x0: x, orig: { start: r.start, end: r.end }, snap: snapshot(), moved: false };
+  } else if (edge) {
     drag = { kind: 'edge', ...edge, snap: snapshot(), moved: false, orig: { ...S.cuts[edge.i] } };
     ui.selCut = edge.i;
   } else if (y < RULER) {
@@ -1164,8 +1413,10 @@ window.addEventListener('mousemove', (e) => {
   if (!drag) {
     if (e.target !== canvas) return;
     const edge = x >= LABEL_W && cutEdgeAt(x, y);
+    const spd = x >= LABEL_W && !edge && speedPartAt(x, y);
+    if (y >= OUT_Y() - 2 && y <= OUT_Y() + OUT_H + 2 && (ui.bookBadges || []).some((b) => x >= b.x0 && x <= b.x1)) { canvas.style.cursor = 'pointer'; return; }
     const tr = trackAt(y);
-    canvas.style.cursor = edge ? 'ew-resize' : y < RULER && x >= LABEL_W ? 'text'
+    canvas.style.cursor = edge || (spd && spd.side !== 'move') ? 'ew-resize' : spd ? 'grab' : y < RULER && x >= LABEL_W ? 'text'
       : tr && rangeAt(S.cuts, tOf(x)) < 0 && clipAt(tr, tOf(x)) ? 'grab' : 'default';
     return;
   }
@@ -1194,6 +1445,19 @@ window.addEventListener('mousemove', (e) => {
     for (const [c, s] of drag.starts) c.start = frameRound(s + dt);
     segCache = null; viewMap = null; drawDirty = true;
     renderClipInfo();
+  } else if (drag.kind === 'speed') {
+    if (Math.abs(x - drag.x0) < 3 && !drag.moved) return;
+    drag.moved = true;
+    const r = drag.r, o = drag.orig, dt = (x - drag.x0) / ui.view.pps, min = 1 / fps();
+    if (drag.side === 'start') r.start = clamp(frameRound(o.start + dt), 0, r.end - min);
+    else if (drag.side === 'end') r.end = clamp(frameRound(o.end + dt), r.start + min, timelineEnd());
+    else {
+      const d = clamp(dt, -o.start, timelineEnd() - o.end);
+      r.start = frameRound(o.start + d); r.end = frameRound(o.end + d);
+      canvas.style.cursor = 'grabbing';
+    }
+    segCache = null; viewMap = null; drawDirty = true;
+    updateStats();
   } else if (drag.kind === 'edge') {
     const c = S.cuts[drag.i];
     drag.moved = true;
@@ -1203,7 +1467,7 @@ window.addEventListener('mousemove', (e) => {
   }
 });
 
-window.addEventListener('mouseup', () => {
+window.addEventListener('mouseup', (e) => {
   if (!drag) return;
   if (drag.kind === 'clip') {
     if (drag.moved) { pushUndo(drag.snap); changed(); } else seek(drag.t);
@@ -1213,6 +1477,14 @@ window.addEventListener('mouseup', () => {
     ui.sel = null; seek(drag.t); updateSelInfo();
   } else if (drag.kind === 'click') {
     seek(drag.t);
+  } else if (drag.kind === 'speed') {
+    if (drag.moved) {
+      pushUndo(drag.snap); settleSpeedPart(drag.r); changed(false); renderMusic(); renderAutoSpeed();
+    }
+    // select it, so "Speed here" shows its speed and can change or remove it
+    ui.selClip = null; ui.selPieceT = null; ui.sel = { start: drag.r.start, end: drag.r.end };
+    updateSelInfo(); renderClipInfo();
+    if (!drag.moved) openSpeedMenu(drag.r, e.clientX, e.clientY);
   } else if (drag.kind === 'edge' && drag.moved) {
     pushUndo(drag.snap);
     const c = S.cuts[drag.i], o = drag.orig;
@@ -1365,6 +1637,126 @@ function activityOf(c) {
   const a = k === 1 ? out : Float32Array.from({ length: Math.round(n * k) }, (_, i) => out[Math.min(n - 1, Math.floor(i / k))]);
   ACT[c.id] = { k, a };
   return a;
+}
+
+// ------------------------------------------------------------------ auto speed
+// Quiet stretches play faster, busy ones at normal speed, to reach a target length. The
+// kept footage is cut in windows of a few seconds; each gets the activity of the cameras
+// shown; the quieter a window is compared with the others, the faster it plays, from normal
+// speed for the busiest to the fastest allowed for the quietest. One knob (the curve's
+// shape) is searched until the video has the wanted length.
+const AUTO_LEVELS = [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 6, 8];
+const AUTO_WIN = 5;   // seconds of timeline per window
+
+function autoSpeedWindows() {
+  const manual = S.speeds.filter((r) => !r.auto);
+  const keep = [];   // [start, end] of chapters kept at normal speed, and of chapter openings
+  const chs = placedChapters();
+  chs.forEach((c, i) => {
+    const end = i + 1 < chs.length ? chs[i + 1].at : timelineEnd();
+    keep.push(c.normal ? [c.at, end] : [c.at, c.at + 20 * (S.output.speed || 1)]);
+  });
+  const wins = [];
+  let fixed = 0;   // output seconds of the parts with a speed set by hand
+  for (const sg of segments()) {
+    const base = S.output.speed || 1;   // the export's overall speed
+    const m = manual.find((r) => sg.start >= r.start - 1e-6 && sg.end <= r.end + 1e-6);
+    if (m) { fixed += sg.dur / (m.speed * base); continue; }
+    const n = Math.max(1, Math.round(sg.dur / AUTO_WIN));
+    for (let i = 0; i < n; i++) {
+      const a = sg.start + (sg.dur * i) / n, b = sg.start + (sg.dur * (i + 1)) / n;
+      let act = 0;
+      for (const k of ['a', 'b']) {
+        const p = sg[k];
+        if (!p || sg.layout.mode === (k === 'a' ? 'B' : 'A')) continue;
+        const c = S.clips.find((x) => x.id === p.clip);
+        if (!c || !DIFFS[c.id] || !DIFFS[c.id].smooth) continue;
+        const arr = activityOf(c), f = fps();
+        let s = 0, cnt = 0;
+        for (let j = Math.floor((a - c.start) * f); j < Math.ceil((b - c.start) * f); j++) if (j >= 0 && j < arr.length) { s += arr[j]; cnt++; }
+        if (cnt) act = Math.max(act, s / cnt);
+      }
+      const locked = keep.some(([x, y]) => a < y && b > x);
+      wins.push({ a, b, act, base, locked });
+    }
+  }
+  // rank: 0 = the quietest window, 1 = the busiest
+  const order = [...wins].sort((x, y) => x.act - y.act);
+  order.forEach((w, i) => { w.rank = order.length > 1 ? i / (order.length - 1) : 1; });
+  return { wins, fixed };
+}
+
+// Speeds for a curve g: a window ranked r plays at 1 + (max−1)·(1−r)^g, snapped to a level
+// (large g: only the quietest go fast; small g: almost everything does).
+// A speed held for less than 3 windows takes its neighbours' (no flickering speeds).
+function autoSpeedsFor(wins, q, max) {
+  const snap = (v) => AUTO_LEVELS.filter((l) => l <= max).reduce((best, l) => (Math.abs(l - v) < Math.abs(best - v) ? l : best), 1);
+  let sp = wins.map((w) => (w.locked ? 1 : snap(1 + (max - 1) * (1 - w.rank) ** q)));
+  sp = sp.map((v, i) => (wins[i].locked ? 1 : [sp[i - 1] ?? v, v, sp[i + 1] ?? v].sort((x, y) => x - y)[1]));   // median of 3
+  for (let pass = 0; pass < 2; pass++) {
+    let i = 0;
+    while (i < sp.length) {
+      let j = i;
+      while (j + 1 < sp.length && sp[j + 1] === sp[i]) j++;
+      if (j - i + 1 < 3 && !wins[i].locked) {
+        const left = i > 0 ? sp[i - 1] : null, right = j + 1 < sp.length ? sp[j + 1] : null;
+        const v = left == null ? right : right == null ? left : Math.min(left, right);   // prefer the slower neighbour
+        if (v != null) for (let k = i; k <= j; k++) if (!wins[k].locked) sp[k] = v;
+      }
+      i = j + 1;
+    }
+  }
+  return sp;
+}
+const autoLength = (wins, sp, fixed) => fixed + wins.reduce((n, w, i) => n + (w.b - w.a) / (sp[i] * w.base), 0);
+
+function applyAutoSpeed() {
+  const A = S.settings.autoSpeed;
+  const info = $('#asInfo');
+  if (S.clips.some((c) => !MISSING.has(c.id) && !(DIFFS[c.id] && DIFFS[c.id].smooth))) {
+    info.textContent = 'Some clips are still being analysed: try again when the activity graphs are all there.';
+    return;
+  }
+  pushUndo();
+  S.speeds = S.speeds.filter((r) => !r.auto);
+  segCache = null;
+  const was = outputSeconds();
+  const { wins, fixed } = autoSpeedWindows();
+  if (!wins.length) { info.textContent = 'Nothing to speed up.'; return; }
+  const want = A.target, slowest = autoLength(wins, wins.map(() => 1), fixed);
+  let sp = wins.map(() => 1);
+  if (slowest > want) {
+    let lo = Math.log(0.03), hi = Math.log(30);   // searched in log space: the curve's exponent
+    for (let it = 0; it < 40; it++) {
+      const g = (lo + hi) / 2;
+      sp = autoSpeedsFor(wins, Math.exp(g), A.max);
+      if (autoLength(wins, sp, fixed) > want) hi = g; else lo = g;
+    }
+    sp = autoSpeedsFor(wins, Math.exp(lo), A.max);
+  }
+  // runs of the same speed become "Speed here" parts (marked auto, so they can be redone)
+  const add = [];
+  wins.forEach((w, i) => {
+    if (sp[i] === 1) return;
+    const last = add[add.length - 1];
+    if (last && last.speed === sp[i] && Math.abs(last.end - w.a) < 1e-6) last.end = w.b;
+    else add.push({ start: w.a, end: w.b, speed: sp[i], auto: true });
+  });
+  S.speeds = [...S.speeds, ...add].sort((a, b) => a.start - b.start);
+  changed(false); renderMusic();
+  const got = outputSeconds(), share = (v) => Math.round((100 * sp.filter((x) => x === v).length) / sp.length);
+  info.textContent = `${fmtDur(was)} → ${fmtDur(got)}` + (got > want + 5 ? ` (the fastest allowed speed can't go shorter than this)` : '')
+    + `. Normal speed for ${share(1)}% of the footage; ` + AUTO_LEVELS.filter((l) => l > 1 && share(l)).map((l) => `${l}× for ${share(l)}%`).join(', ')
+    + '. Blue on the Output row; change any part with Speed here (⌘Z undoes).';
+}
+
+function renderAutoSpeed() {
+  const A = (S.settings.autoSpeed = { target: 540, max: 4, ...(S.settings.autoSpeed || {}) });
+  $('#asTarget').value = A.target; $('#asTargetOut').value = fmtDur(A.target);
+  $('#asMax').value = String(A.max);
+  $('#asClear').hidden = !S.speeds.some((r) => r.auto);
+  const R = S.settings.speedRamp ?? 3;
+  $('#asRamp').value = R; $('#asRampOut').value = R ? `${R} s` : 'off';
 }
 
 // Offer to fix clips whose file dates say they were shot at another interval (asked once per clip).
@@ -1595,8 +1987,9 @@ function renderMusic() {
   $('#musFadeIn').value = M.fadeIn; $('#musFadeInOut').value = `${M.fadeIn} s`;
   $('#musFadeOut').value = M.fadeOut; $('#musFadeOutOut').value = `${M.fadeOut} s`;
   $('#musLoop').checked = !!M.loop;
+  $('#musXfade').value = M.crossfade ?? 3; $('#musXfadeOut').value = `${M.crossfade ?? 3} s`;
   $('#muteBtn').textContent = ui.muted ? '🔇' : '🔊';
-  const total = M.tracks.reduce((n, t) => n + t.duration, 0) - (M.offset || 0), D = outputSeconds();
+  const total = M.tracks.reduce((n, t) => n + t.duration, 0) - xfadeLen() * Math.max(0, M.tracks.length - 1) - (M.offset || 0), D = totalSeconds();
   $('#musInfo').textContent = !M.tracks.length
     ? 'Songs play back to back over the exported video. 🔊 under the preview mutes it while you edit.'
     : total >= D ? `Music ${fmtDur(total)} for a ${fmtDur(D)} video: it fades out at the end.`
@@ -1690,72 +2083,114 @@ function renderClipInfo() {
   };
 }
 
-// Find screens in the selected part (or the selected clip) and blur them there.
-async function autoBlurScreens() {
-  const sel = target();
-  const clip = S.clips.find((x) => x.id === ui.selClip);
-  const r = sel || (clip && { start: clip.start, end: clipEnd(clip) });
+// Auto areas found part by part each have their own shape, which jumps from one part to
+// the next. The same screen in neighbouring parts of a clip (overlapping a lot, at most a
+// couple of minutes apart) becomes one area with one shape covering them all.
+function hullOf(pts) {
+  const P = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const half = (list) => {
+    const h = [];
+    for (const p of list) { while (h.length >= 2 && cross(h[h.length - 2], h[h.length - 1], p) <= 0) h.pop(); h.push(p); }
+    h.pop(); return h;
+  };
+  let h = [...half(P), ...half([...P].reverse())];
+  const tri = (a, b, c) => Math.abs(cross(a, b, c)) / 2;
+  while (h.length > 10) {   // drop the corner that matters least
+    let k = 0, best = Infinity;
+    h.forEach((p, i) => { const a = tri(h[(i + h.length - 1) % h.length], p, h[(i + 1) % h.length]); if (a < best) { best = a; k = i; } });
+    h.splice(k, 1);
+  }
+  return h;
+}
+function mergeAutoBlurs(ids) {
+  const iou = (a, b) => {
+    const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+    const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+    return (ix * iy) / (a.w * a.h + b.w * b.h - ix * iy || 1);
+  };
+  let before = 0, after = 0;
+  for (const id of ids) {
+    const all = S.blurs[id] || [];
+    const auto = all.filter((b) => b.auto && b.label !== 'text' && b.start != null).sort((a, b) => a.start - b.start);
+    const groups = [];
+    for (const b of auto) {
+      const g = groups.find((x) => b.start - x.end <= 150 && iou(x, b) >= 0.5);
+      if (!g) { groups.push({ ...b, pts: cornersOf(b).map((p) => [...p]) }); continue; }
+      g.start = Math.min(g.start, b.start); g.end = Math.max(g.end, b.end);
+      setCorners(g, hullOf([...g.pts, ...cornersOf(b)]));
+    }
+    before += auto.length; after += groups.length;
+    S.blurs[id] = [...all.filter((b) => !auto.includes(b)), ...groups];
+  }
+  return [before, after];
+}
+
+// Find screens and blur them where found: in the selected part (or the selected clip), or
+// in the whole video. Running it again on the same part replaces what it found before.
+async function autoBlurScreens(whole = false) {
   const info = $('#selInfo');
+  if (ui.blurRun) { ui.blurRun.stop = true; info.textContent = 'Stopping after this part…'; return; }
   let jobs;
-  if (r) {
-    jobs = S.clips.filter((c) => c.start < r.end && clipEnd(c) > r.start && !MISSING.has(c.id))
-      .map((c) => ({ c, t0: Math.max(r.start, c.start) - c.start, t1: Math.min(r.end, clipEnd(c)) - c.start }));
-  } else {
-    // Nothing selected: the whole video, in parts of a minute or so (a camera or a laptop
-    // may move during a clip), only the cameras that are shown.
-    const parts = textJobs(1).flatMap((j) => {
+  if (whole) {
+    // The whole exported video, a minute or so at a time (a camera or a laptop may move
+    // during a clip), on the cameras that are shown.
+    jobs = textJobs(1).flatMap((j) => {
       const c = S.clips.find((x) => x.id === j.clip), k = stretch(c);
       const a = j.s0 * k, b = j.s1 * k, n = Math.max(1, Math.round((b - a) / 60));
       return Array.from({ length: n }, (_, i) => ({ c, t0: a + ((b - a) * i) / n, t1: a + ((b - a) * (i + 1)) / n }));
     });
-    if (!parts.length) { info.textContent = 'No footage to look at.'; return; }
-    if (!confirm(`Look for screens in the whole video (${parts.length} parts, about ${Math.ceil(parts.length / 3)} min)? They are blurred where found (⌘Z undoes).`)) return;
-    jobs = parts;
+    if (!jobs.length) { info.textContent = 'No footage to look at.'; return; }
+    if (!confirm(`Look for screens in the whole video (${jobs.length} parts, about ${Math.ceil(jobs.length / 3)} min) and blur them where found? You can stop it; ⌘Z undoes it.`)) return;
+  } else {
+    const sel = target(), clip = S.clips.find((x) => x.id === ui.selClip);
+    const r = sel || (clip && { start: clip.start, end: clipEnd(clip) });
+    if (!r) { info.textContent = 'Select a part (click a piece or drag a range) or a clip first, or use “Whole video”.'; return; }
+    jobs = S.clips.filter((c) => c.start < r.end && clipEnd(c) > r.start && !MISSING.has(c.id))
+      .map((c) => ({ c, t0: Math.max(r.start, c.start) - c.start, t1: Math.min(r.end, clipEnd(c)) - c.start }));
   }
   jobs = jobs.map((j) => ({ ...j, s0: j.t0 / stretch(j.c), s1: j.t1 / stretch(j.c) }))
     .filter((j) => j.t1 - j.t0 > 1 / fps());
   if (!jobs.length) { info.textContent = 'No footage in the selection.'; return; }
-  const btn = $('#autoBlurBtn');
-  btn.disabled = true;
+  const btn = $(whole ? '#autoBlurAllBtn' : '#autoBlurBtn'), other = $(whole ? '#autoBlurBtn' : '#autoBlurAllBtn');
+  const label = btn.textContent;
+  ui.blurRun = { stop: false };
+  btn.textContent = '■ Stop'; other.disabled = true;
   const snap = snapshot();
-  let found = 0, clipsHit = 0, note = '';
+  let found = 0, done = 0, note = '';
+  const hit = new Set();
   try {
     for (const [i, j] of jobs.entries()) {
+      if (ui.blurRun.stop) break;
       info.textContent = `Looking for screens… ${j.c.name} (${i + 1}/${jobs.length})${i ? '' : ' — the first time loads the models, ~30 s'}`;
       const res = await api('/api/detect_screens', { clip: j.c.id, t0: j.s0, t1: j.s1 });
       if (res.error) throw new Error(res.error);
       if (res.note) note = ` (Screen ${res.note}.)`;
-      if (!res.boxes.length) continue;
-      clipsHit++; found += res.boxes.length;
-      const list = (S.blurs[j.c.id] = S.blurs[j.c.id] || []);
-      for (const b of res.boxes) list.push({ ...b, start: j.c.start + j.t0, end: j.c.start + j.t1, auto: true });
+      const a = j.c.start + j.t0, b = j.c.start + j.t1;
+      const list = (S.blurs[j.c.id] = (S.blurs[j.c.id] || [])
+        .filter((x) => !(x.auto && x.label !== 'text' && x.start >= a - 1e-3 && x.end <= b + 1e-3)));
+      for (const bx of res.boxes) list.push({ ...bx, start: a, end: b, auto: true });
+      if (res.boxes.length) { hit.add(j.c.id); found += res.boxes.length; }
+      done++;
+      changed(false);   // saved as it goes: a long run survives a reload
     }
-    if (found) { pushUndo(snap); changed(false); if (ui.selClip) renderClipInfo(); }
+    const areas = mergeAutoBlurs(hit)[1];
+    pushUndo(snap); changed(false);
+    if (ui.selClip) renderClipInfo();
+    const what = whole ? (done < jobs.length ? `${done} of ${jobs.length} parts of the video (stopped)` : 'the whole video') : 'this part';
     info.textContent = found
-      ? `Blurred ${found} screen(s) in ${clipsHit} clip(s) for this part, following their corners. Check the preview: click the clip and drag a yellow corner to adjust, or remove a wrong one with its ✕ in the Clip panel (⌘Z undoes all).${note}`
-      : 'No screen found in this part.';
+      ? `Blurred ${areas} screen area(s) in ${hit.size} clip(s) in ${what}, each with one steady shape. Check the preview: click a clip and drag a yellow corner to adjust, or remove a wrong one with its ✕ in the Clip panel (⌘Z undoes all).${note}`
+      : `No screen found in ${what}.`;
   } catch (e) {
+    if (done) { mergeAutoBlurs(new Set(jobs.map((j) => j.c.id))); pushUndo(snap); changed(false); }
     info.textContent = `Screen detection failed: ${e.message}`;
-  } finally { btn.disabled = false; }
+  } finally {
+    ui.blurRun = null; btn.textContent = label; other.disabled = false;
+  }
 }
 
 // ------------------------------------------------------------------ titles and counter
 
-// Build time so far: real time filmed up to master time t (time covered by any clip,
-// so nights and breaks don't count; still parts that were cut do).
-let buildCache = null, buildFor = null;
-function buildAt(t) {
-  const key = S.clips.map((c) => `${c.id}:${c.start}:${c.interval || ''}`).join();
-  if (buildFor !== key) {
-    const spans = mergeRanges(S.clips.map((c) => ({ start: c.start, end: clipEnd(c) })));
-    let acc = 0;
-    buildCache = spans.map((r) => { const o = { ...r, acc }; acc += r.end - r.start; return o; });
-    buildFor = key;
-  }
-  let v = 0;
-  for (const r of buildCache) { if (t < r.start) break; v = r.acc + Math.min(t, r.end) - r.start; }
-  return v * ratio();
-}
 const fmtBuild = (sec) => { const m = Math.floor(sec / 60); return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')}`; };
 
 // Output time of master time t, or of the next kept moment when t is cut.
@@ -1765,6 +2200,23 @@ function outAtOrAfter(t) {
   const sg = segments().find((x) => x.end > t);
   return sg ? outAt(sg.start) : null;
 }
+// The cream opening sequence and end card are added before and after the video.
+const introLen = () => (S.titles.intro.style === 'opening' ? S.titles.intro.dur : 0);
+const endLen = () => (S.titles.outro.style === 'card' ? S.titles.outro.dur : 0);
+const totalSeconds = () => introLen() + outputSeconds() + endLen();
+function autoSubtitle() {
+  const kept = segments().reduce((n, sg) => n + sg.dur, 0) * ratio() / 3600;
+  return `${Math.round(kept)} hours of build, in ${Math.max(1, Math.round(totalSeconds() / 60))} minutes`;
+}
+function openingSpec() {
+  const T = S.titles.intro;
+  return { dur: T.dur, look: S.titles.look || 'dark', title: T.title, sub: T.sub.trim() || autoSubtitle(), question: T.question || '', photo: T.photo || '',
+    hook: (T.hook || []).filter((h) => h && h.path).map((h) => ({ path: h.path, start: h.start || 0 })) };
+}
+function endcardSpec() {
+  const O = S.titles.outro, idx = [0, 1, 2].filter((i) => (O.logos || [])[i]);
+  return { dur: O.dur, look: S.titles.look || 'dark', lines: O.lines, logos: idx.map((i) => O.logos[i]), logoSizes: idx.map((i) => (O.logoSizes || [])[i] || 100) };
+}
 const placedChapters = () => S.titles.chapters.filter((c) => c.at != null).sort((a, b) => a.at - b.at);
 
 // Everything drawn over the video, in output seconds: the export draws it, the preview shows it.
@@ -1773,24 +2225,30 @@ function overlayPlan() {
   const segs = segments(), T = S.titles, key = JSON.stringify(T);
   if (planFor && planFor[0] === segs && planFor[1] === key) return planCache;
   const total = outputSeconds(), cards = [];
-  if (T.intro.title.trim()) cards.push({ kind: 'intro', t0: 0, dur: T.intro.dur, title: T.intro.title, sub: T.intro.sub, fadeIn: 0.5, fadeOut: 0.8 });
+  if (T.intro.title.trim() && T.intro.style !== 'opening') cards.push({ kind: 'intro', t0: 0, dur: T.intro.dur, title: T.intro.title, sub: T.intro.sub, fadeIn: 0.5, fadeOut: 0.8 });
   const chs = placedChapters();
+  const outroT = T.outro.lines.trim() && T.outro.style !== 'card' ? Math.max(0, total - T.outro.dur) : total;
+  const starts = chs.map((c) => outAtOrAfter(c.at));
   chs.forEach((c, i) => {
-    const o = outAtOrAfter(c.at);
-    if (o != null && c.name.trim()) cards.push({ kind: 'chapter', t0: o, dur: T.chapterDur, title: c.name, num: `Chapter ${i + 1} / ${chs.length}`, fadeIn: 0.4, fadeOut: 0.6 });
+    const o = starts[i];
+    if (o == null || !c.name.trim()) return;
+    const num = `Chapter ${i + 1} / ${chs.length}`;
+    cards.push({ kind: 'chapter', t0: o, dur: T.chapterDur, title: c.name, num, fadeIn: 0.4, fadeOut: 0.6 });
+    // then a small label until the next chapter (or the end notes)
+    const next = Math.min(outroT, ...starts.slice(i + 1).filter((x) => x != null && x > o));
+    if (T.tag !== false && next - (o + T.chapterDur) > 1) cards.push({ kind: 'tag', t0: o + T.chapterDur, dur: next - o - T.chapterDur, title: c.name, num, fadeIn: 0.5, fadeOut: 0.3 });
   });
-  const outroT = T.outro.lines.trim() ? Math.max(0, total - T.outro.dur) : total;
   if (outroT < total) cards.push({ kind: 'outro', t0: outroT, dur: total - outroT, lines: T.outro.lines.trim(), fadeIn: 1, fadeOut: 0.5 });
   // The counter's minute changes (-1 = hidden), hidden during the intro and the end notes.
   const events = [];
   if (T.counter.on) {
     const from = cards[0] && cards[0].kind === 'intro' ? cards[0].dur - 0.4 : 0;
-    const zero = segs.length ? buildAt(segs[0].start) : 0;   // counting from the first kept moment
-    let acc = 0;
+    // Only the footage kept in the video counts (cut still parts, nights and breaks don't).
+    let acc = 0, kept = 0;
     for (const sg of segs) {
       acc -= sg.fade;
-      const o0 = acc / fps(), d = sg.frames / fps(), b0 = buildAt(sg.start) - zero, b1 = buildAt(sg.end) - zero;
-      acc += sg.frames;
+      const o0 = acc / outFps(), d = sg.frames / outFps(), b0 = kept, b1 = kept + sg.dur * ratio();
+      acc += sg.frames; kept = b1;
       events.push([o0, Math.floor(b0 / 60)]);
       for (let m = Math.floor(b0 / 60) + 1; m <= Math.floor(b1 / 60) && b1 > b0; m++) events.push([o0 + ((m * 60 - b0) / (b1 - b0)) * d, m]);
     }
@@ -1798,7 +2256,8 @@ function overlayPlan() {
     for (const e of events) if (e[0] >= outroT) e[1] = -1;
     if (from > 0) events.unshift([0, -1]);
   }
-  planCache = { cards, counter: { corner: T.counter.corner, events } };
+  planCache = { cards, counter: { corner: T.counter.corner, events },
+    intro: T.intro.style === 'opening' ? openingSpec() : null, endcard: T.outro.style === 'card' ? endcardSpec() : null };
   planFor = [segs, key];
   return planCache;
 }
@@ -1816,11 +2275,11 @@ function layoutTitles() {
     const op = Math.min(1, (o - c.t0) / Math.max(0.01, c.fadeIn), (c.t0 + c.dur - o) / Math.max(0.01, c.fadeOut));
     card.className = `tcard ${c.kind}`;
     card.style.opacity = clamp(op, 0, 1);
-    const html = c.kind === 'chapter' ? `<div class="tnum"></div><div class="tmain"></div>`
+    const html = c.kind === 'chapter' || c.kind === 'tag' ? `<div class="tnum"></div><div class="tmain"></div>`
       : `<div class="tmain"></div>${(c.kind === 'intro' ? [c.sub] : c.lines.split('\n').slice(1)).map(() => '<div class="tsub"></div>').join('')}`;
     if (card._key !== JSON.stringify(c)) {
       card.innerHTML = html; card._key = JSON.stringify(c);
-      const lines = c.kind === 'chapter' ? [c.num, c.title] : c.kind === 'intro' ? [c.title, c.sub] : c.lines.split('\n');
+      const lines = c.kind === 'chapter' || c.kind === 'tag' ? [c.num, c.title] : c.kind === 'intro' ? [c.title, c.sub] : c.lines.split('\n');
       [...card.children].forEach((d, i) => { d.textContent = lines[i] || ''; });
     }
   } else card.style.opacity = 0;
@@ -1842,21 +2301,40 @@ function renderTitles() {
   $('#tiOutro').value = T.outro.lines;
   $('#tiOutroDur').value = T.outro.dur; $('#tiOutroDurOut').value = `${T.outro.dur} s`;
   $('#tiCounter').checked = T.counter.on; $('#tiCorner').value = T.counter.corner;
+  $('#tiTag').checked = T.tag !== false;
+  $('#tiLook').value = T.look || 'dark';
+  $('#tiIntroStyle').value = T.intro.style || 'text'; $('#tiOpening').hidden = T.intro.style !== 'opening';
+  $('#tiOutroStyle').value = T.outro.style || 'over'; $('#tiEndcard').hidden = T.outro.style !== 'card';
+  $('#tiQuestion').value = T.intro.question || ''; $('#tiPhoto').value = T.intro.photo || '';
+  for (const i of [0, 1]) {
+    const h = (T.intro.hook || [])[i] || {};
+    $(`#tiHook${i}`).value = h.path || ''; $(`#tiHook${i}From`).value = h.start || 0;
+  }
+  for (const i of [0, 1, 2]) {
+    $(`#tiLogo${i}`).value = (T.outro.logos || [])[i] || '';
+    $(`#tiLogo${i}Size`).value = (T.outro.logoSizes || [])[i] || 100;
+  }
+  $('#tiSub').placeholder = T.intro.style === 'opening' ? autoSubtitle() : 'e.g. 62 hours of work in 8 minutes';
   const list = $('#chapterList');
   list.innerHTML = '';
   T.chapters.forEach((c, i) => {
     const row = document.createElement('div');
     row.className = 'mrow chrow';
     row.innerHTML = `<input type="text" class="chname" placeholder="Chapter name"><button class="chat" title="Go there"></button>
+      <button class="ch1x${c.normal ? ' on' : ''}" title="Keep this whole chapter at normal speed (Auto speed)">1×</button>
       <button title="Start this chapter at the playhead">📍</button><button title="Remove">✕</button>`;
-    const [name, at, pin, rm] = row.querySelectorAll('input, button');
+    const [name, at, x1, pin, rm] = row.querySelectorAll('input, button');
+    x1.onclick = () => { c.normal = !c.normal; renderTitles(); scheduleSave(); };
     name.value = c.name;
     at.textContent = c.at == null ? 'not placed' : fmtVideo(c.at);
     at.disabled = c.at == null;
     name.oninput = () => { c.name = name.value; scheduleSave(); };
     at.onclick = () => { setPlaying(false); seek(c.at); followPlayhead(); };
     pin.onclick = () => { c.at = ui.t; renderTitles(); scheduleSave(); };
-    rm.onclick = () => { T.chapters.splice(i, 1); renderTitles(); scheduleSave(); };
+    rm.onclick = () => {
+      if (c.name.trim() && !confirm(`Remove the chapter “${c.name}”?`)) return;
+      T.chapters.splice(i, 1); renderTitles(); scheduleSave();
+    };
     list.appendChild(row);
   });
   const n = placedChapters().length;
@@ -1865,16 +2343,58 @@ function renderTitles() {
     : 'Add chapters to show a title when each part of the build starts.';
 }
 function bindTitles() {
-  const T = S.titles, save = () => { renderTitles(); scheduleSave(); };
-  $('#tiTitle').oninput = (e) => { T.intro.title = e.target.value; scheduleSave(); };
-  $('#tiSub').oninput = (e) => { T.intro.sub = e.target.value; scheduleSave(); };
-  $('#tiIntroDur').oninput = (e) => { T.intro.dur = parseFloat(e.target.value); save(); };
-  $('#tiChDur').oninput = (e) => { T.chapterDur = parseFloat(e.target.value); save(); };
-  $('#tiOutro').oninput = (e) => { T.outro.lines = e.target.value; scheduleSave(); };
-  $('#tiOutroDur').oninput = (e) => { T.outro.dur = parseFloat(e.target.value); save(); };
-  $('#tiCounter').onchange = (e) => { T.counter.on = e.target.checked; save(); };
-  $('#tiCorner').onchange = (e) => { T.counter.corner = e.target.value; save(); };
-  $('#chapterAdd').onclick = () => { T.chapters.push({ name: '', at: ui.t }); save(); };
+  const T = () => S.titles, save = () => { renderTitles(); scheduleSave(); prepareBookends(); updateStats(); drawDirty = true; };   // S.titles may be replaced (reloadState)
+  $('#tiTitle').oninput = (e) => { T().intro.title = e.target.value; scheduleSave(); };
+  $('#tiSub').oninput = (e) => { T().intro.sub = e.target.value; scheduleSave(); };
+  $('#tiIntroDur').oninput = (e) => { T().intro.dur = parseFloat(e.target.value); save(); };
+  $('#tiChDur').oninput = (e) => { T().chapterDur = parseFloat(e.target.value); save(); };
+  $('#tiOutro').oninput = (e) => { T().outro.lines = e.target.value; scheduleSave(); };
+  $('#tiOutroDur').oninput = (e) => { T().outro.dur = parseFloat(e.target.value); save(); };
+  $('#tiCounter').onchange = (e) => { T().counter.on = e.target.checked; save(); };
+  $('#tiCorner').onchange = (e) => { T().counter.corner = e.target.value; save(); };
+  $('#tiTag').onchange = (e) => { T().tag = e.target.checked; save(); };
+  $('#tiIntroStyle').onchange = (e) => {
+    const I = T().intro; I.style = e.target.value;
+    if (I.style === 'opening' && I.dur < 8) I.dur = 10;
+    if (I.style === 'opening' && !I.question) I.question = 'How do we turn this into a walking robot?';
+    save(); renderMusic();
+  };
+  $('#tiLook').onchange = (e) => { T().look = e.target.value; save(); };
+  $('#tiOutroStyle').onchange = (e) => { T().outro.style = e.target.value; save(); renderMusic(); };
+  $('#tiQuestion').oninput = (e) => { T().intro.question = e.target.value; scheduleSave(); };
+  $('#tiPhoto').onchange = (e) => { T().intro.photo = e.target.value.trim(); scheduleSave(); };
+  const hook = (i) => { const I = T().intro; I.hook = I.hook || []; return (I.hook[i] = I.hook[i] || { path: '', start: 0 }); };
+  for (const i of [0, 1]) {
+    $(`#tiHook${i}`).onchange = (e) => { hook(i).path = e.target.value.trim(); scheduleSave(); };
+    $(`#tiHook${i}From`).onchange = (e) => { hook(i).start = parseFloat(e.target.value) || 0; scheduleSave(); };
+  }
+  const logos = () => (T().outro.logos = T().outro.logos || []);
+  for (const i of [0, 1, 2]) {
+    $(`#tiLogo${i}`).onchange = (e) => { logos()[i] = e.target.value.trim(); scheduleSave(); };
+    $(`#tiLogo${i}Size`).onchange = (e) => { (T().outro.logoSizes = T().outro.logoSizes || [])[i] = parseFloat(e.target.value) || 100; scheduleSave(); };
+  }
+  for (const b of $$('[data-pick]')) b.onclick = async () => {
+    const k = b.dataset.pick, r = await api('/api/pick_media', { kind: k.startsWith('hook') ? 'video' : 'image' });
+    if (!r.paths || !r.paths.length) return;
+    if (k === 'photo') T().intro.photo = r.paths[0];
+    else if (k.startsWith('hook')) hook(+k.slice(4)).path = r.paths[0];
+    else logos()[+k.slice(4)] = r.paths[0];
+    save();
+  };
+  const preview = async (which, btn) => {
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Rendering…';
+    try {
+      let url;
+      try { url = await bookendUrl(which); } catch (e) { alert(`Could not render it: ${e.message}`); return; }
+      $('#previewTitle').textContent = which === 'intro' ? 'Opening sequence' : 'End card';
+      $('#previewVideo').src = url; $('#previewDlg').showModal(); $('#previewVideo').play().catch(() => {});
+    } finally { btn.disabled = false; btn.textContent = label; }
+  };
+  $('#tiIntroPreview').onclick = () => preview('intro', $('#tiIntroPreview'));
+  $('#tiOutroPreview').onclick = () => preview('endcard', $('#tiOutroPreview'));
+  $('#previewDlg').onclose = () => $('#previewVideo').pause();
+  $('#chapterAdd').onclick = () => { T().chapters.push({ name: '', at: ui.t }); save(); };
 }
 
 function renderBlurStrength() {
@@ -2070,7 +2590,7 @@ function bindInspector() {
     }
   };
   $('#forgetKeepsBtn').onclick = () => { pushUndo(); S.keeps = []; changed(); };
-  for (const [sel, key] of [['#musVol', 'volume'], ['#musOffset', 'offset'], ['#musFadeIn', 'fadeIn'], ['#musFadeOut', 'fadeOut']]) {
+  for (const [sel, key] of [['#musVol', 'volume'], ['#musOffset', 'offset'], ['#musFadeIn', 'fadeIn'], ['#musFadeOut', 'fadeOut'], ['#musXfade', 'crossfade']]) {
     $(sel).oninput = (e) => { S.music[key] = parseFloat(e.target.value); renderMusic(); scheduleSave(); };
   }
   $('#musLoop').onchange = (e) => { S.music.loop = e.target.checked; renderMusic(); scheduleSave(); };
@@ -2098,7 +2618,24 @@ function bindInspector() {
   $('#hideABtn').onclick = () => hideSel('A');
   $('#hideBBtn').onclick = () => hideSel('B');
   $('#unhideBtn').onclick = unhideSel;
-  $('#autoBlurBtn').onclick = autoBlurScreens;
+  $('#autoBlurBtn').onclick = () => autoBlurScreens(false);
+  $('#autoBlurAllBtn').onclick = () => autoBlurScreens(true);
+  $('#blurClearBtn').onclick = () => {
+    const n = Object.values(S.blurs).flat().length;
+    if (!n) { $('#selInfo').textContent = 'There are no blur areas.'; return; }
+    if (!confirm(`Remove all ${n} blur areas? (⌘Z undoes)`)) return;
+    pushUndo(); S.blurs = {}; changed(false);
+    if (ui.selClip) renderClipInfo();
+    $('#selInfo').textContent = `Removed ${n} blur areas.`;
+  };
+  $('#asTarget').oninput = (e) => { S.settings.autoSpeed.target = parseFloat(e.target.value); renderAutoSpeed(); scheduleSave(); };
+  $('#asRamp').oninput = (e) => { S.settings.speedRamp = parseFloat(e.target.value); renderAutoSpeed(); changed(false); renderMusic(); };
+  $('#asMax').onchange = (e) => { S.settings.autoSpeed.max = parseFloat(e.target.value); scheduleSave(); };
+  $('#asApply').onclick = () => { applyAutoSpeed(); renderAutoSpeed(); };
+  $('#asClear').onclick = () => {
+    pushUndo(); S.speeds = S.speeds.filter((r) => !r.auto); changed(false); renderMusic(); renderAutoSpeed();
+    $('#asInfo').textContent = `Auto speeds removed: ${fmtDur(outputSeconds())}.`;
+  };
   $('#textScanBtn').onclick = startTextScan;
   $('#textCancelBtn').onclick = () => api('/api/textscan/cancel', {});
   $('#textAll').onchange = renderText;
@@ -2238,6 +2775,8 @@ function openExport() {
   $('#exPath').value = O.lastPath || `${PROJECT_DIR}/timelapse-${stamp}.mp4`;
   $('#exRes').value = `${O.width}x${O.height}`;
   $('#exEnc').value = O.encoder; $('#exSpeed').value = String(O.speed);
+  $('#exFps').value = O.fps && O.fps > fps() + 1 ? 'double' : 'same';
+  $('#exBlend').checked = O.blend !== false;
   updateExportSummary();
   const ex = lastStatus.export || {};
   if (!ex.running) { $('#exStatus').textContent = ''; $('#exProgress').hidden = true; $('#exReveal').hidden = true; }
@@ -2245,24 +2784,25 @@ function openExport() {
 }
 function readExportForm() {
   const [w, h] = $('#exRes').value.split('x').map(Number);
-  Object.assign(S.output, { width: w, height: h, encoder: $('#exEnc').value, speed: parseFloat($('#exSpeed').value) });
+  Object.assign(S.output, { width: w, height: h, encoder: $('#exEnc').value, speed: parseFloat($('#exSpeed').value),
+    fps: $('#exFps').value === 'double' ? Math.round(fps() * 2 * 1000) / 1000 : null, blend: $('#exBlend').checked });
   segCache = null; viewMap = null;
 }
 function updateExportSummary() {
   readExportForm();
   const segs = segments();
-  $('#exSummary').textContent = `${segs.length} piece(s) · final length ${fmtDur(outputSeconds())} · layout: ${S.layout.mode}`;
+  $('#exSummary').textContent = `${segs.length} piece(s) · final length ${fmtDur(totalSeconds())} · ${Math.round(outFps())} fps · layout: ${S.layout.mode}`;
   fitStage(); updateStats(); scheduleSave();
 }
-for (const id of ['#exRes', '#exEnc', '#exSpeed']) $(id).onchange = updateExportSummary;
+for (const id of ['#exRes', '#exEnc', '#exSpeed', '#exFps', '#exBlend']) $(id).onchange = updateExportSummary;
 $('#exportBtn').onclick = openExport;
 $('#exStart').onclick = async () => {
   readExportForm();
   S.output.lastPath = $('#exPath').value;
   scheduleSave();
   const r = await api('/api/export', {
-    segments: segments().map(({ dur, a, b, frames, fade, layout, blur, speed }) => ({ dur, a, b, frames, fade, layout, blur, speed })),
-    layout: S.layout, output: { ...S.output, path: $('#exPath').value }, fps: fps(),
+    segments: segments().map(({ dur, a, b, frames, fade, layout, blur, speed, sp0, sp1 }) => ({ dur, a, b, frames, fade, layout, blur, speed, sp0, sp1 })),
+    layout: S.layout, output: { ...S.output, path: $('#exPath').value }, fps: outFps(), footageFps: fps(),
     blurStrength: S.settings.blurStrength ?? 1, overlays: overlayPlan(),
   });
   if (r.error) $('#exStatus').textContent = r.error;
@@ -2302,6 +2842,8 @@ async function poll() {
     renderExport(st.export || {});
     renderGen(st.musicgen || {});
     renderTextScan(st.textscan || {});
+    PROXIES = st.proxy || {};
+    if (st.rev > REV && !saveTimer) await reloadState();
   } catch (e) { /* server restarting */ }
   setTimeout(poll, 1000);
 }
@@ -2404,7 +2946,7 @@ window.addEventListener('keydown', (e) => {
 
 async function boot() {
   const r = await api('/api/state');
-  S = r.state; AN = r.analysis; PROJECT_DIR = r.projectDir;
+  S = r.state; AN = r.analysis; PROJECT_DIR = r.projectDir; REV = r.rev || 0;
   setMissing(r.missing || []);
   CHANGES_SEEN = r.changes || 0;
   S.cuts = normCuts(S.cuts || []);
@@ -2415,12 +2957,14 @@ async function boot() {
   S.speeds = S.speeds || [];
   S.titles = { intro: { title: '', sub: '', dur: 4 }, chapters: [], chapterDur: 3, outro: { lines: '', dur: 6 },
     counter: { on: false, corner: 'tl' }, ...(S.titles || {}) };
+  S.titles.intro = { style: 'text', question: '', photo: '', hook: [], ...S.titles.intro };
+  S.titles.outro = { style: 'over', logos: [], ...S.titles.outro };
   S.transitions = S.transitions || { session: 12, cut: 4 };
   S.blurs = S.blurs || {};
   S.music = { tracks: [], volume: 0.8, fadeIn: 1, fadeOut: 3, offset: 0, loop: true, ...(S.music || {}) };
   MUSIC_MISSING = new Set(r.musicMissing || []);
   renderTrackNames(); renderMusic(); renderLayout(); renderDetect(); bindInspector(); updateSelInfo();
-  renderTitles(); renderBlurStrength(); bindTitles();
+  renderTitles(); renderBlurStrength(); bindTitles(); renderAutoSpeed(); prepareBookends();
   resizeCanvas(); fitStage(); zoomFit(); updateStats();
   for (const c of S.clips) if (AN[c.id] && AN[c.id].status === 'done') loadDiffs(c.id);
   const f0 = S.clips[0] && S.clips[0].fps;

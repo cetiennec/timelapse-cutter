@@ -33,6 +33,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import numpy as np
 
+import intro as opening   # the cream opening sequence and end card
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts"}
@@ -72,7 +74,8 @@ def default_state():
         "output": {"width": 1920, "height": 1080, "encoder": "x264", "speed": 1.0},
         # Soundtrack: songs played back to back from `offset` s into the first one,
         # looped if shorter than the video, faded in/out at the video's ends.
-        "music": {"tracks": [], "volume": 0.8, "fadeIn": 1.0, "fadeOut": 3.0, "offset": 0.0, "loop": True},
+        "music": {"tracks": [], "volume": 0.8, "fadeIn": 1.0, "fadeOut": 3.0, "offset": 0.0, "loop": True,
+                  "crossfade": 3.0},
         # Blurred areas (e.g. a computer screen), per clip: {clip id: [{x, y, w, h}]} as
         # fractions of the source frame.
         "blurs": {},
@@ -124,6 +127,7 @@ def missing_ids():
 
 
 CHANGES = {"n": 0, "events": [], "checked": 0.0}
+REV = {"n": 0}   # bumped on every edit saved from a page, so other open pages reload it
 
 
 def refresh_changed():
@@ -155,6 +159,7 @@ def refresh_changed():
             shutil.rmtree(clip_dir(c["id"]), ignore_errors=True)
             ANALYSIS.pop(c["id"], None)
             queue_analysis(c["id"])
+            queue_proxy(c["id"])
             events.append(ev)
     if events:
         with LOCK:
@@ -346,6 +351,7 @@ def add_clips(track, paths):
             STATE["clips"].append(clip)
             added.append(clip)
         queue_analysis(cid)
+        queue_proxy(cid)
     with LOCK:
         save_state()
     return added, errors
@@ -490,9 +496,12 @@ def mux_music(video, out, music):
                        capture_output=True, text=True)
     dur = float(r.stdout.strip())
     tracks = music["tracks"]
-    total = sum(t["duration"] for t in tracks)
-    offset = min(max(0.0, float(music.get("offset", 0))), max(0.0, total - 0.1))
-    reps = max(1, int(-(-(offset + dur) // total))) if music.get("loop", True) else 1
+    # Each song cross-fades into the next over X seconds (the preview does the same).
+    X = max(0.0, float(music.get("crossfade", 3.0))) if len(tracks) > 1 else 0.0
+    X = min(X, 0.45 * min(t["duration"] for t in tracks)) if tracks else 0.0
+    period = sum(t["duration"] - X for t in tracks)
+    offset = min(max(0.0, float(music.get("offset", 0))), max(0.0, period - 0.1))
+    reps = max(1, int(-(-(offset + dur + X) // period))) if music.get("loop", True) else 1
     seq = (tracks * reps)[:200]
     inputs, chain = [], []
     for i, t in enumerate(seq):
@@ -506,7 +515,14 @@ def mux_music(video, out, music):
         post += f",afade=t=in:st=0:d={min(fi, dur):.3f}"
     if fo:
         post += f",afade=t=out:st={max(0.0, dur - fo):.3f}:d={min(fo, dur):.3f}"
-    chain.append(f"{a}concat=n={len(seq)}:v=0:a=1,{post},apad[aout]")
+    if X and len(seq) > 1:
+        cur = "m0"
+        for i in range(1, len(seq)):
+            chain.append(f"[{cur}][m{i}]acrossfade=d={X:.3f}:c1=tri:c2=tri[x{i}]")
+            cur = f"x{i}"
+        chain.append(f"[{cur}]{post},apad[aout]")
+    else:
+        chain.append(f"{a}concat=n={len(seq)}:v=0:a=1,{post},apad[aout]")
     run_ffmpeg(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", video, *inputs,
                 "-filter_complex", ";".join(chain), "-map", "0:v", "-map", "[aout]",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{dur:.3f}",
@@ -990,6 +1006,76 @@ def analysis_worker():
             traceback.print_exc()
 
 
+# ---------------------------------------------------------------- preview copies
+
+# The preview plays light copies (540p, ~3 Mbps, a keyframe every second): every photo of a
+# timelapse is different, so the originals are heavy to decode at 2-8x, two at a time. The
+# export always uses the originals. A copy is named after its source's size and date, so a
+# replaced file gets a new one.
+PROXY = {}   # clip id -> "queued" | "making" | "ready" | "error"
+PROXY_QUEUE = queue.Queue()
+
+
+def proxy_path(clip):
+    try:
+        st = os.stat(clip["path"])
+    except OSError:
+        return None
+    return os.path.join(clip_dir(clip["id"]), f"proxy-{st.st_size}-{int(st.st_mtime)}.mp4")
+
+
+def queue_proxy(cid):
+    with LOCK:
+        clip = clip_by_id(cid)
+    p = clip and proxy_path(clip)
+    if not p:
+        return
+    if os.path.exists(p):
+        PROXY[cid] = "ready"
+    elif PROXY.get(cid) not in ("queued", "making"):
+        PROXY[cid] = "queued"
+        PROXY_QUEUE.put(cid)
+
+
+def proxy_worker():
+    while True:
+        cid = PROXY_QUEUE.get()
+        while any(a.get("status") in ("queued", "running") for a in ANALYSIS.values()) or EXPORT.get("running"):
+            time.sleep(2)   # the analysis and exports come first
+        with LOCK:
+            clip = clip_by_id(cid)
+        out = clip and proxy_path(clip)
+        if not out:
+            PROXY.pop(cid, None)
+            continue
+        PROXY[cid] = "making"
+        tmp = out + ".part.mp4"
+        try:
+            for f in os.listdir(clip_dir(cid)):
+                if f.startswith("proxy-"):
+                    os.remove(os.path.join(clip_dir(cid), f))
+            os.makedirs(clip_dir(cid), exist_ok=True)
+            base = ["ffmpeg", "-v", "error", "-nostdin", "-y"]
+            tail = ["-i", clip["path"], "-map", "0:v:0", "-an", "-vf", "scale=-2:540", "-fps_mode", "passthrough",
+                    "-g", str(max(1, round(clip.get("fps") or 30))), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+            r = subprocess.run(base + ["-hwaccel", "videotoolbox"] + tail + ["-c:v", "h264_videotoolbox", "-b:v", "3M", tmp],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                r = subprocess.run(base + tail + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", tmp],
+                                   capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip()[-300:])
+            os.replace(tmp, out)
+            PROXY[cid] = "ready"
+        except Exception as e:
+            PROXY[cid] = "error"
+            print(f"Preview copy of {clip['name']} failed: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------- export
 
 def even(x):
@@ -997,9 +1083,10 @@ def even(x):
 
 
 def fit(inp, w, h, fill, out, fps, timing):
-    """`timing` = (speed, off): play `speed` times faster; the first decoded frame belongs
-    `off` seconds (of the file) after the wanted start, which may be negative."""
-    speed, off = timing
+    """`timing` = (speed, off, mix): play `speed` times faster; the first decoded frame belongs
+    `off` seconds (of the file) after the wanted start, which may be negative; when a frame
+    stands for `mix` > 1 photos, it shows their average instead of only one of them."""
+    speed, off, mix, ramp = (tuple(timing) + (None,))[:4]
     if fill:
         f = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
     else:
@@ -1007,7 +1094,14 @@ def fit(inp, w, h, fill, out, fps, timing):
              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black")
     # tpad: hold the last frame if the file ends a frame short of what is asked.
     # fps from time 0 keeps whole-frame steps in the same place however a part is split.
-    return (f"[{inp}]setpts=(PTS-STARTPTS+{off:.6f}/TB)/{speed:.6f},tpad=stop_mode=clone:stop_duration=2,"
+    blend = f"tmix=frames={mix}," if mix > 1 else ""
+    if ramp:   # speed changing linearly: a photo T seconds in shows at A·ln(1 + B·T)
+        a, b = ramp
+        pts = f"setpts={a:.9f}*log(1+{b:.9f}*((PTS-STARTPTS)*TB+{off:.6f}))/TB"
+    else:
+        pts = f"setpts=(PTS-STARTPTS+{off:.6f}/TB)/{speed:.6f}"
+    # settb: fine timestamps first, or dividing them rounds two photos onto the same tick
+    return (f"[{inp}]{blend}settb=AVTB,{pts},tpad=stop_mode=clone:stop_duration=2,"
             f"fps={fps}:start_time=0,{f},setsar=1,format=yuv420p[{out}]")
 
 
@@ -1054,7 +1148,7 @@ def blur_filter(src, boxes, sigma, out):
     return ";".join(parts) + f";[{cur}]null[{out}]"
 
 
-def segment_filter(seg, lay, W, H, fps, speed, blurs=None, offs=None):
+def segment_filter(seg, lay, W, H, fps, speed, blurs=None, offs=None, mixes=None, ramps=None):
     """Build a filter graph for one segment. Inputs: 0 = A (if present), next = B.
     `blurs` maps "A"/"B" to (boxes, sigma) for the areas to blur in that source.
     A source shot at a longer photo interval (`stretch` > 1) is played slower."""
@@ -1075,8 +1169,8 @@ def segment_filter(seg, lay, W, H, fps, speed, blurs=None, offs=None):
             if f:
                 pre.append(f)
                 idx[s_] = f"blur{s_}"
-    sp = {s_: (speed / float((seg.get(s_.lower()) or {}).get("stretch") or 1), (offs or {}).get(s_, 0.0))
-          for s_ in srcs}
+    sp = {s_: (speed / float((seg.get(s_.lower()) or {}).get("stretch") or 1), (offs or {}).get(s_, 0.0),
+               (mixes or {}).get(s_, 1), (ramps or {}).get(s_)) for s_ in srcs}
     return ";".join(pre + [layout_filter(srcs, idx, lay, W, H, fps, sp, fill, mode)])
 
 
@@ -1136,9 +1230,20 @@ def run_ffmpeg(cmd, what):
 def render_segment(seg, first, nframes, out, ctx, enc):
     """Render output frames [first, first + nframes) of one segment."""
     fps, speed = ctx["fps"], float(seg.get("speed") or ctx["speed"])   # parts can be sped up
-    skip = first * speed / fps
+    # The speed may go linearly from sp0 to sp1 over the segment (a ramp between two speeds).
+    D = float(seg.get("dur") or 1)
+    sp0, sp1 = float(seg.get("sp0") or speed), float(seg.get("sp1") or speed)
+
+    def footage_at(y):   # seconds of footage into the segment after y seconds of output
+        d = sp1 - sp0
+        return y * sp0 if abs(d) < 1e-9 else D * sp0 / d * (math.exp(y * d / D) - 1)
+
+    x0, x1, x2 = (footage_at(f / fps) for f in (first, first + nframes, first + nframes + 2))
+    q0, q1 = sp0 + (sp1 - sp0) * x0 / D, sp0 + (sp1 - sp0) * x1 / D   # speeds at the ends of this render
+    skip = x0
+    speed = q0
     cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y"]
-    blurs, offs = {}, {}
+    blurs, offs, mixes, ramps = {}, {}, {}, {}
     for key in ("a", "b"):
         s = seg.get(key)
         if s:
@@ -1150,7 +1255,7 @@ def render_segment(seg, first, nframes, out, ctx, enc):
             if "blur" in seg:   # the UI sends the boxes active in this segment
                 boxes = list((seg["blur"] or {}).get(key) or [])
             sigma = max(6.0, 0.02 * min(clip["width"] or 1080, clip["height"] or 1080)) * ctx.get("blur", 1.0)
-            if boxes and sigma >= 0.5:
+            if boxes and sigma > 0.05:
                 blurs[key.upper()] = (boxes, sigma, (clip["width"] or 1920, clip["height"] or 1080))
             k = float(s.get("stretch") or 1)   # timeline seconds per second of this file
             # Start on the file's frame shown at the wanted time, seeking half a frame before
@@ -1160,8 +1265,14 @@ def render_segment(seg, first, nframes, out, ctx, enc):
             want = s["t"] + skip / k
             n0 = min(int(math.floor(want * cf + 0.01)), max(0, (clip.get("frames") or 1) - 1))
             offs[key.upper()] = n0 / cf - want
-            cmd += ["-ss", f"{max(0, (n0 - 0.5) / cf):.4f}", "-t", f"{(nframes + 2) * speed / fps / k + 1 / cf:.4f}",
+            # photos of this file per output frame: above ~1.5, blend them rather than skip
+            per = (q0 + q1) / 2 / k * cf / fps
+            mixes[key.upper()] = int(round(per)) if ctx.get("blend", True) and per >= 1.5 else 1
+            cmd += ["-ss", f"{max(0, (n0 - 0.5) / cf):.4f}", "-t", f"{(x2 - x0) / k + 1 / cf:.4f}",
                     "-i", clip["path"]]
+            if abs(q1 - q0) > 1e-6 and x1 > x0:
+                ls, a0, a1 = (x1 - x0) / k, q0 / k, q1 / k   # in seconds of this file
+                ramps[key.upper()] = (ls / (a1 - a0), (a1 - a0) / (ls * a0))
     # Areas with corners (a screen seen at an angle) are blurred through a mask image of
     # their shape, one more input each.
     n_in = sum(1 for key in ("a", "b") if seg.get(key))
@@ -1177,9 +1288,9 @@ def render_segment(seg, first, nframes, out, ctx, enc):
             out_boxes.append(b)
         blurs[src] = (out_boxes, sigma)
     lay = seg.get("layout") or ctx["layout"]   # per-part layout overrides come with the segment
-    cmd += ["-filter_complex", segment_filter(seg, lay, ctx["W"], ctx["H"], fps, speed, blurs, offs),
+    cmd += ["-filter_complex", segment_filter(seg, lay, ctx["W"], ctx["H"], fps, speed, blurs, offs, mixes, ramps),
             "-map", "[out]", "-frames:v", str(nframes), "-r", f"{fps:g}", "-an",
-            *enc, "-pix_fmt", "yuv420p", "-video_track_timescale", "30000", out]
+            *enc, "-pix_fmt", "yuv420p", "-video_track_timescale", "60000", out]
     run_ffmpeg(cmd, "segment")
 
 
@@ -1194,7 +1305,7 @@ def render_dissolve(prev, cur, d, out, ctx):
                 f"[0:v][1:v]xfade=transition=fade:duration={d / fps:.4f}:offset=0,format=yuv420p[out]",
                 "-map", "[out]", "-frames:v", str(d), "-r", f"{fps:g}", "-an",
                 *encoder_args(ctx["encoder"]), "-pix_fmt", "yuv420p",
-                "-video_track_timescale", "30000", out], "dissolve")
+                "-video_track_timescale", "60000", out], "dissolve")
 
 
 # ---------------------------------------------------------------- titles and counter
@@ -1223,7 +1334,12 @@ def text_card(card, W, H, path):
         d.text((xy[0] + 2 * k, xy[1] + 2 * k), text, font=f, fill=shadow, anchor=anchor)
         d.text(xy, text, font=f, fill=fill, anchor=anchor)
 
-    if card["kind"] == "chapter":
+    if card["kind"] == "tag":   # the chapter name, small, for the rest of the chapter
+        x, y = 48 * k, H - 40 * k
+        if card.get("num"):
+            line((x, y - 44 * k), card["num"].upper(), font(17 * k, True), (255, 214, 10, 255), "ls")
+        line((x, y), card.get("title", ""), font(32 * k, True), anchor="ls")
+    elif card["kind"] == "chapter":
         band = Image.new("L", (1, H), 0)   # soft shade under the title
         for y in range(H):
             band.putpixel((0, y), int(170 * max(0.0, (y - 0.55 * H) / (0.45 * H)) ** 1.4))
@@ -1316,7 +1432,43 @@ def add_overlays(video, out, ov, ctx, tmp):
         return
     run_ffmpeg(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", video, *inputs,
                 "-filter_complex", ";".join(chain), "-map", f"[{cur}]", "-t", f"{dur:.3f}",
-                *encoder_args(ctx["encoder"]), "-pix_fmt", "yuv420p", "-movflags", "+faststart", out], "titles")
+                *encoder_args(ctx["encoder"]), "-pix_fmt", "yuv420p", "-video_track_timescale", "60000",
+                "-movflags", "+faststart", out], "titles")
+
+
+def frame_png(video, at_end, out):
+    """The first (or last) frame of a video, as a picture."""
+    pos = ["-sseof", "-0.2"] if at_end else []
+    r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", *pos, "-i", video, "-update", "1",
+                        "-frames:v", "1" if not at_end else "999", out], capture_output=True, text=True)
+    return out if r.returncode == 0 and os.path.exists(out) else None
+
+
+def add_bookends(video, out, ov, ctx, tmp):
+    """Put the opening sequence before the video and the end card after it."""
+    W, H, fps, enc = ctx["W"], ctx["H"], ctx["fps"], encoder_args(ctx["encoder"])
+    parts = []
+    if ov.get("intro"):
+        EXPORT["step"] = "opening sequence"
+        spec = dict(ov["intro"], next_frame=frame_png(video, False, os.path.join(tmp, "first.png")))
+        opening.render_intro(spec, W, H, fps, os.path.join(tmp, "intro.mp4"), enc)
+        parts.append(os.path.join(tmp, "intro.mp4"))
+    parts.append(video)
+    if ov.get("endcard"):
+        EXPORT["step"] = "end card"
+        spec = dict(ov["endcard"], prev_frame=frame_png(video, True, os.path.join(tmp, "last.png")))
+        opening.render_outro(spec, W, H, fps, os.path.join(tmp, "outro.mp4"), enc)
+        parts.append(os.path.join(tmp, "outro.mp4"))
+    lst = os.path.join(tmp, "bookends.txt")
+    with open(lst, "w") as f:
+        f.writelines(f"file '{p}'\n" for p in parts)
+    r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                        "-c", "copy", "-movflags", "+faststart", out], capture_output=True, text=True)
+    if r.returncode != 0:   # encoded differently: join them by re-encoding
+        ins = sum((["-i", p] for p in parts), [])
+        fc = "".join(f"[{i}:v]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[v]"
+        run_ffmpeg(["ffmpeg", "-v", "error", "-nostdin", "-y", *ins, "-filter_complex", fc, "-map", "[v]",
+                    *enc, "-pix_fmt", "yuv420p", "-movflags", "+faststart", out], "joining the opening")
 
 
 def export_worker(job):
@@ -1324,7 +1476,8 @@ def export_worker(job):
         out = job["output"]
         ctx = {"layout": job["layout"], "W": even(out["width"]), "H": even(out["height"]),
                "fps": float(job.get("fps", 30.0)), "speed": max(0.1, float(out.get("speed", 1.0))),
-               "encoder": out.get("encoder"), "blur": max(0.0, float(job.get("blurStrength", 1.0)))}
+               "encoder": out.get("encoder"), "blur": max(0.0, float(job.get("blurStrength", 1.0))),
+               "blend": out.get("blend", True) is not False}
         # Each segment carries its output length in frames and `fade`, the number of
         # frames it cross-fades with the previous segment (computed by the UI).
         segs = [s for s in job["segments"] if int(s.get("frames", 0)) >= 1]
@@ -1375,7 +1528,8 @@ def export_worker(job):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         ov = job.get("overlays") or {}
         has_ov = bool(ov.get("cards") or (ov.get("counter") or {}).get("events"))
-        joined = os.path.join(tmp, "joined.mp4") if music["tracks"] or has_ov else path
+        books = bool(ov.get("intro") or ov.get("endcard"))
+        joined = os.path.join(tmp, "joined.mp4") if music["tracks"] or has_ov or books else path
         r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0",
                             "-i", lst, "-c", "copy", "-movflags", "+faststart", joined],
                            capture_output=True, text=True)
@@ -1383,9 +1537,13 @@ def export_worker(job):
             raise RuntimeError(r.stderr.strip()[-800:])
         if has_ov:
             EXPORT["step"] = "adding titles"
-            titled = os.path.join(tmp, "titled.mp4") if music["tracks"] else path
+            titled = os.path.join(tmp, "titled.mp4") if music["tracks"] or books else path
             add_overlays(joined, titled, ov, ctx, tmp)
             joined = titled
+        if books:
+            booked = os.path.join(tmp, "booked.mp4") if music["tracks"] else path
+            add_bookends(joined, booked, ov, ctx, tmp)
+            joined = booked
         if music["tracks"]:
             EXPORT["step"] = "adding music"
             mux_music(joined, path, music)
@@ -1497,7 +1655,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(f)
         if p == "/api/state":
             with LOCK:
-                return self.send_json({"state": STATE, "analysis": ANALYSIS, "projectDir": PROJECT_DIR,
+                return self.send_json({"state": STATE, "analysis": ANALYSIS, "projectDir": PROJECT_DIR, "rev": REV["n"],
                                        "missing": missing_ids(), "musicMissing": music_missing(),
                                        "changes": CHANGES["n"]})
         if p == "/api/status":
@@ -1510,7 +1668,7 @@ class Handler(BaseHTTPRequestHandler):
             scan = {k: v for k, v in TEXTSCAN.items() if k not in ("hits", "steps")}
             return self.send_json({"analysis": ANALYSIS, "export": ex, "missing": miss,
                                    "changes": CHANGES["n"], "changed": CHANGES["events"],
-                                   "musicgen": MUSICGEN, "textscan": scan})
+                                   "musicgen": MUSICGEN, "textscan": scan, "rev": REV["n"], "proxy": PROXY})
         if p == "/api/textscan":
             if "hits" in TEXTSCAN:
                 return self.send_json({k: TEXTSCAN[k] for k in ("hits", "frames", "steps")})
@@ -1518,6 +1676,9 @@ class Handler(BaseHTTPRequestHandler):
             if os.path.exists(f):
                 return self.send_file(f, "application/json")
             return self.send_json({"hits": None})
+        m = re.fullmatch(r"/preview/(intro|endcard)", p)
+        if m:
+            return self.send_file(os.path.join(CACHE_DIR, f"preview-{m.group(1)}.mp4"), "video/mp4")
         m = re.fullmatch(r"/api/diffs/([0-9a-f]{12})", p)
         if m:
             return self.send_file(os.path.join(clip_dir(m.group(1)), "diffs.json"), "application/json")
@@ -1527,6 +1688,10 @@ class Handler(BaseHTTPRequestHandler):
                 clip = clip_by_id(m.group(1))
             if not clip:
                 return self.send_error(404)
+            if "proxy" in parse_qs(url.query):
+                pp = proxy_path(clip)
+                if pp and os.path.exists(pp):
+                    return self.send_file(pp, "video/mp4")
             ext = os.path.splitext(clip["path"])[1].lower()
             ctype = "video/webm" if ext == ".webm" else "video/mp4"
             return self.send_file(clip["path"], ctype)
@@ -1564,7 +1729,8 @@ class Handler(BaseHTTPRequestHandler):
                             c["interval"] = upd[c["id"]].get("interval") or None
                             c["placed"] = True
                 save_state()
-            return self.send_json({"ok": True})
+                REV["n"] = max(REV["n"] + 1, int(time.time() * 1000))   # grows across restarts
+            return self.send_json({"ok": True, "rev": REV["n"]})
         if p in ("/api/add", "/api/pick"):
             track = data.get("track", "A")
             paths = pick_files() if p == "/api/pick" else data.get("paths", [])
@@ -1592,6 +1758,39 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 traceback.print_exc()
                 return self.send_json({"error": str(e)}, 500)
+        if p == "/api/pick_media":
+            kind = data.get("kind")
+            return self.send_json({"paths": pick_files("Choose a picture" if kind == "image" else "Choose videos",
+                                                       "public.image" if kind == "image" else "public.movie")})
+        if p == "/api/bookend_preview":
+            # render the opening sequence (or the end card) alone, to watch it before exporting
+            which = "endcard" if data.get("which") == "endcard" else "intro"
+            out = os.path.join(CACHE_DIR, f"preview-{which}.mp4")
+            W, H = even(data.get("width", 1920)), even(data.get("height", 1080))
+            try:
+                fn = opening.render_outro if which == "endcard" else opening.render_intro
+                silent = out + ".silent.mp4"
+                fn(data.get("spec") or {}, W, H, float(data.get("fps", 30)), silent,
+                   ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+                with LOCK:
+                    music = json.loads(json.dumps(STATE["music"]))
+                if music["tracks"] and not music_missing():
+                    # the music it gets in the export: from the start under the opening, the
+                    # end of it (fading out) under the end card
+                    start = max(0.0, float(data.get("musicAt", 0)))
+                    music["offset"] = float(music.get("offset", 0)) + start
+                    if start > 0:
+                        music["fadeIn"] = 0
+                    if which != "endcard":
+                        music["fadeOut"] = 0
+                    mux_music(silent, out, music)
+                    os.remove(silent)
+                else:
+                    os.replace(silent, out)
+            except Exception as e:
+                traceback.print_exc()
+                return self.send_json({"error": str(e)}, 500)
+            return self.send_json({"url": f"/preview/{which}?t={int(time.time())}"})
         if p == "/api/textscan":
             if TEXTSCAN.get("running"):
                 return self.send_json({"error": "a text check is already running"}, 409)
@@ -1628,7 +1827,9 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/reanalyze":
             cid = data.get("id")
             shutil.rmtree(clip_dir(cid), ignore_errors=True)
+            PROXY.pop(cid, None)
             queue_analysis(cid)
+            queue_proxy(cid)
             return self.send_json({"ok": True})
         if p == "/api/export":
             if EXPORT.get("running"):
@@ -1669,9 +1870,13 @@ def main():
     load_state()
 
     threading.Thread(target=analysis_worker, daemon=True).start()
+    threading.Thread(target=proxy_worker, daemon=True).start()
     with LOCK:
-        for c in STATE["clips"]:
-            queue_analysis(c["id"])
+        ids = [c["id"] for c in STATE["clips"]]
+    for cid in ids:
+        queue_analysis(cid)
+    for cid in ids:
+        queue_proxy(cid)
     if args.a:
         add_clips("A", args.a)
     if args.b:

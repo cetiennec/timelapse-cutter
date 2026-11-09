@@ -66,6 +66,12 @@ Run the same command again to continue where you left off.
   switches to another clip, e.g. a new day, where the camera may have moved a bit; default 12 frames) and
   one *at cuts* and layout changes (default 4 frames). Joins that get a dissolve are marked ◆ on the
   Output row; the preview shows them too. Each dissolve shortens the video by its length.
+- **Light preview copies.** Every photo of a timelapse is different, so the original files are heavy to
+  decode at 2–8× speed, two at a time. After the analysis, the app makes a 540p copy of each clip in the
+  background (in `.cutter/`, ~3 Mbps) and the preview plays those; the export always uses the originals.
+  A camera that isn't on screen is paused.
+- **Several windows.** The project can be open in several tabs (or driven by Claude): an edit saved in one
+  shows up in the others within a second, so they don't overwrite each other.
 - **Blur.** To hide a computer screen (or anything else), click a clip, then **▭ Draw blur area** in the Clip
   panel and drag a box on the picture (that camera is shown alone while you draw; Esc cancels). Blur
   areas belong to the clip, since a camera may sit differently each day; **Copy to same day** / **Copy to
@@ -82,12 +88,32 @@ Run the same command again to continue where you left off.
   minute at a time, on the cameras that are shown. **Blur strength** makes every blur lighter or stronger
   (0 turns blurring off without removing the areas).
 - **Speed per part.** **Speed here** (Edit panel) plays the selected part 1.5× to 8× faster in the preview and
-  the export, on top of the export's overall speed; such parts show a blue mark and their speed on the Output row.
+  the export, on top of the export's overall speed; such parts show a blue mark and their speed on the Output row. Drag a part's
+  edge there to extend or shorten it, its middle to move it, and click it to select it (Speed here then
+  changes or removes it). A part edited by hand is kept when Auto speed runs again.
+  Where the speed changes it doesn't jump: it ramps smoothly over a few seconds of footage (*Smooth speed
+  changes over*, 3 s by default, 0 for instant changes). The export follows the ramp photo by photo, and the
+  preview, titles and music follow it too.
+- **Auto speed.** In the Edit panel: set a target length and the fastest speed allowed, and **⚡ Auto speed**
+  plays the quiet parts faster and keeps the busy ones at normal speed, from the activity graphs: each few
+  seconds of kept footage is ranked from quietest to busiest and gets a speed along a curve, which is adjusted
+  until the video has the target length. Speeds held only a few seconds are smoothed out. Each chapter's first
+  20 s stays at normal speed, and so does a whole chapter marked **1×** in the Titles panel. The result is
+  ordinary *Speed here* parts (change any by hand); running it again redoes them, **Remove auto speeds** clears
+  them, ⌘Z undoes.
 - **Titles.** The Titles panel adds an intro (title and subtitle over the first seconds, on a darkened frame),
-  chapter titles (📍 starts a chapter at the playhead; its name shows at the bottom left for a few seconds) and
+  chapter titles (📍 starts a chapter at the playhead; its name shows big at the bottom left for a few
+  seconds, then small until the next chapter, unless that option is off) and
   end notes over the last seconds (one line each, the first one big). **Show the build time counter** adds the
-  real time of work filmed so far in a corner (nights and breaks between recordings don't count), from 0 h 00
-  at the first kept moment. The preview shows all of it; the export draws it in one last pass.
+  real time of the footage shown so far in a corner: only what is kept in the video counts (not the cut still
+  parts, nights or breaks), from 0 h 00 at the start. The preview shows all of it; the export draws it in one last pass.
+- **Opening sequence and end card.** In the Titles panel, *Intro* can instead be a 10 s opening before the
+  video, in a cream, coral and serif look: one or two videos (e.g. the first walk) playing as rounded cards,
+  then a photo (e.g. all the parts on the floor) with a question appearing word by word, then the title and
+  subtitle (left empty, the subtitle says the build time and the video's length), fading into the timelapse.
+  *End notes* can be an end card after the video: "Thanks for watching" (the first line), up to three logos
+  and the other lines small. **▶ Preview** renders either one alone to watch it; the export adds them, with
+  the music running under both. They are drawn by `intro.py`.
 - **Readable text.** **🔍 Check for readable text** (Readable text panel) reads the text visible in the kept
   parts, or the selected part, with Apple Vision (built into macOS; a small Swift helper, `ocr.swift`, is
   compiled on first use, which needs the Xcode command-line tools). It takes a frame every 0.5–5 s of the final
@@ -99,7 +125,9 @@ Run the same command again to continue where you left off.
 - **Music.** **＋ Add music…** in the Music panel picks songs (mp3, m4a, wav, flac…); they play back to
   back over the exported video, in list order (↑ to reorder), from *Start the music at* into the first song,
   looped if shorter than the video (or silent after, if *Loop* is off), with a volume and a fade in / fade
-  out at the video's ends. The preview plays it in time with the output; 🔊 under the preview mutes it.
+  out at the video's ends, and each song cross-fading into the next (*Crossfade between songs*, 3 s by default).
+  While music plays, the preview follows the music's clock, so the sound stays smooth and the picture keeps up
+  with it; 🔊 under the preview mutes it.
   The export copies the video and adds the music as AAC.
   **✨ Generate music…** makes songs with [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) (MIT
   license): describe the style, choose one song or one every ~4 min to fill the video; the songs are sized to
@@ -108,7 +136,10 @@ Run the same command again to continue where you left off.
   or optionally the online ACE-Step Space (needs `gradio_client`, often busy).
 - **Export.** Each kept piece is rendered with ffmpeg at the chosen resolution and joined without
   re-encoding. Options: resolution (incl. 4K, wide, vertical), x264 (quality) or Apple hardware (fast)
-  encoder, and a speed-up factor.
+  encoder, a speed-up factor, and a frame rate. A sped-up part has more photos than frames to show them:
+  at **60 fps** a part played 2× still shows every photo (twice the footage's 30), and 4× half of them
+  instead of a quarter. With **Blend the photos a frame skips**, a frame standing for several photos shows
+  their average: still things stay sharp, moving ones get a soft motion blur instead of jumping.
 
 ## Keys
 

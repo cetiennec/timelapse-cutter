@@ -47,6 +47,7 @@
         <div class="stage-msg" id="msgB"></div>
         <svg class="blur-corners" id="blurCorners"></svg>
         <canvas class="stage-fade" id="fadeCanvas"></canvas>
+        <div class="stage-book" id="stageBook" hidden><video id="vBook" playsinline muted preload="auto"></video><div class="book-msg" id="bookMsg"></div></div>
         <div class="stage-cut" id="stageCut">CUT</div>
         <div class="stage-titles" id="stageTitles" hidden>
           <div class="tcard" id="titleCard"></div>
@@ -130,6 +131,7 @@
       <label>Start the music at <input type="range" id="musOffset" min="0" max="60" step="1"><output id="musOffsetOut"></output></label>
       <label>Fade in <input type="range" id="musFadeIn" min="0" max="10" step="0.5"><output id="musFadeInOut"></output></label>
       <label>Fade out <input type="range" id="musFadeOut" min="0" max="15" step="0.5"><output id="musFadeOutOut"></output></label>
+      <label>Crossfade between songs <input type="range" id="musXfade" min="0" max="8" step="0.5"><output id="musXfadeOut"></output></label>
       <label class="check"><input type="checkbox" id="musLoop"> Loop when the music is shorter than the video</label>
       <p class="hint" id="musInfo">Songs play back to back over the exported video. 🔊 under the preview mutes it while you edit.</p>
     </details>
@@ -157,14 +159,30 @@
       <label>Speed here
         <select id="pieceSpeed">
           <option value="1">Normal</option>
+          <option value="1.25">1.25× faster</option>
           <option value="1.5">1.5× faster</option>
+          <option value="1.75">1.75× faster</option>
           <option value="2">2× faster</option>
+          <option value="2.5">2.5× faster</option>
           <option value="3">3× faster</option>
           <option value="4">4× faster</option>
           <option value="6">6× faster</option>
           <option value="8">8× faster</option>
         </select>
       </label>
+      <div class="autospeed">
+        <div class="sublabel">Auto speed: quiet parts faster, busy parts at normal speed</div>
+        <label>Target length <input type="range" id="asTarget" min="60" max="1800" step="10"><output id="asTargetOut"></output></label>
+        <label>Smooth speed changes over <input type="range" id="asRamp" min="0" max="8" step="0.5"><output id="asRampOut"></output></label>
+        <label>Fastest
+          <select id="asMax"><option value="2">2×</option><option value="3">3×</option><option value="4">4×</option><option value="6">6×</option><option value="8">8×</option></select>
+        </label>
+        <div class="row wrap">
+          <button id="asApply" class="btn" title="Speed up the quiet parts until the video has the target length (chapters marked 1× and each chapter's first 20 s stay at normal speed)">⚡ Auto speed</button>
+          <button id="asClear" class="btn small" hidden>Remove auto speeds</button>
+        </div>
+        <p class="hint" id="asInfo"></p>
+      </div>
       <div class="row wrap">
         <button id="swapBtn" class="btn" title="W">⇄ Swap PiP here</button>
         <button id="hideABtn" class="btn">Hide A here</button>
@@ -175,22 +193,57 @@
         <button id="clearLayoutsBtn" class="btn small" title="Remove every per-part layout: the default layout applies everywhere">Reset all parts to the default layout</button>
       </div>
       <div class="row wrap">
-        <button id="autoBlurBtn" class="btn" title="Find computer, laptop and phone screens in the selected part or clip (or the whole video when nothing is selected) and blur them there">▭ Blur screens (auto)</button>
+        <button id="autoBlurBtn" class="btn" title="Find computer, laptop and phone screens in the selected part (or clip) and blur them there">▭ Blur screens here</button>
+        <button id="autoBlurAllBtn" class="btn" title="Find screens in the whole video (the parts that are kept, on the cameras that are shown) and blur them where found">▭ Whole video</button>
+        <button id="blurClearBtn" class="btn small" title="Remove every blur area of every clip (⌘Z undoes)">✕ Remove all blurs</button>
       </div>
-      <label>Blur strength <input type="range" id="blurStrength" min="0" max="1.5" step="0.05"><output id="blurStrengthOut"></output></label>
+      <label>Blur strength <input type="range" id="blurStrength" min="0" max="1.5" step="0.01"><output id="blurStrengthOut"></output></label>
     </details>
 
     <details open id="titlesPanel">
       <summary>Titles</summary>
       <label>Intro title <input type="text" id="tiTitle" placeholder="e.g. Building a humanoid robot"></label>
       <label>Intro subtitle <input type="text" id="tiSub" placeholder="e.g. 62 hours of work in 8 minutes"></label>
-      <label>Intro length <input type="range" id="tiIntroDur" min="2" max="10" step="0.5"><output id="tiIntroDurOut"></output></label>
+      <label>Look of the opening and end card
+        <select id="tiLook">
+          <option value="dark">Dark, in the robot's colours (orange accent)</option>
+          <option value="cream">Cream (coral accent)</option>
+        </select>
+      </label>
+      <label>Intro
+        <select id="tiIntroStyle">
+          <option value="text">Title over the first seconds of the video</option>
+          <option value="opening">Opening sequence before the video</option>
+        </select>
+      </label>
+      <div id="tiOpening" class="bookend">
+        <label>Question over the photo <input type="text" id="tiQuestion" placeholder="How do we turn this into a walking robot?"></label>
+        <div class="pathrow"><span>Photo</span><input type="text" id="tiPhoto" placeholder="a picture (e.g. all the parts)"><button class="btn small" data-pick="photo">…</button></div>
+        <div class="pathrow"><span>Video 1</span><input type="text" id="tiHook0" placeholder="the hook, e.g. the first walk"><input type="number" id="tiHook0From" step="0.1" min="0" title="Start at (s)"><button class="btn small" data-pick="hook0">…</button></div>
+        <div class="pathrow"><span>Video 2</span><input type="text" id="tiHook1" placeholder="optional, shown beside it"><input type="number" id="tiHook1From" step="0.1" min="0" title="Start at (s)"><button class="btn small" data-pick="hook1">…</button></div>
+        <p class="hint">The videos play at real speed as two rounded cards, then the photo with the question, then the title and subtitle (left empty: build time and length, filled in), fading into the timelapse.</p>
+        <div class="row wrap"><button id="tiIntroPreview" class="btn small">▶ Preview the opening</button></div>
+      </div>
+      <label>Intro length <input type="range" id="tiIntroDur" min="2" max="16" step="0.5"><output id="tiIntroDurOut"></output></label>
       <div class="sublabel">Chapters</div>
       <div class="mlist" id="chapterList"></div>
       <div class="row wrap"><button id="chapterAdd" class="btn small">＋ Chapter at playhead</button></div>
+      <label class="check"><input type="checkbox" id="tiTag"> Keep the chapter name at the bottom left until the next chapter</label>
       <label>Chapter title length <input type="range" id="tiChDur" min="1.5" max="6" step="0.5"><output id="tiChDurOut"></output></label>
       <label>End notes (one line each, the first one big)
         <textarea id="tiOutro" rows="4" placeholder="Thanks for watching&#10;Built at …&#10;Music: …"></textarea></label>
+      <label>End notes
+        <select id="tiOutroStyle">
+          <option value="over">Over the last seconds of the video</option>
+          <option value="card">End card after the video (with logos)</option>
+        </select>
+      </label>
+      <div id="tiEndcard" class="bookend">
+        <div class="pathrow"><span>Logo 1</span><input type="text" id="tiLogo0" placeholder="picture of a logo"><input type="number" id="tiLogo0Size" min="20" max="300" step="5" title="Size (%)"><button class="btn small" data-pick="logo0">…</button></div>
+        <div class="pathrow"><span>Logo 2</span><input type="text" id="tiLogo1"><input type="number" id="tiLogo1Size" min="20" max="300" step="5" title="Size (%)"><button class="btn small" data-pick="logo1">…</button></div>
+        <div class="pathrow"><span>Logo 3</span><input type="text" id="tiLogo2"><input type="number" id="tiLogo2Size" min="20" max="300" step="5" title="Size (%)"><button class="btn small" data-pick="logo2">…</button></div>
+        <div class="row wrap"><button id="tiOutroPreview" class="btn small">▶ Preview the end card</button></div>
+      </div>
       <label>End notes length <input type="range" id="tiOutroDur" min="3" max="15" step="0.5"><output id="tiOutroDurOut"></output></label>
       <label class="check"><input type="checkbox" id="tiCounter"> Show the build time counter</label>
       <label>Counter corner
@@ -222,6 +275,8 @@
     </details>
   </aside>
 </main>
+
+<div class="speed-menu" id="speedMenu" hidden></div>
 
 <section class="timeline">
   <div class="tl-bar">
@@ -293,6 +348,14 @@
   </form>
 </dialog>
 
+<dialog id="previewDlg" class="wide">
+  <form method="dialog">
+    <h3 id="previewTitle">Preview</h3>
+    <video id="previewVideo" controls playsinline></video>
+    <div class="row end"><button class="btn">Close</button></div>
+  </form>
+</dialog>
+
 <dialog id="exportDlg">
   <form method="dialog">
     <h3>Export</h3>
@@ -319,6 +382,13 @@
         <option value="2">2×</option><option value="3">3×</option><option value="4">4×</option>
       </select>
     </label>
+    <label>Frame rate
+      <select id="exFps">
+        <option value="same">Same as the footage (30 fps)</option>
+        <option value="double">Double (60 fps): sped-up parts keep twice as many photos</option>
+      </select>
+    </label>
+    <label class="check"><input type="checkbox" id="exBlend"> Blend the photos a frame skips (smoother sped-up parts)</label>
     <p class="hint" id="exSummary"></p>
     <div class="progress" id="exProgress" hidden><div></div></div>
     <p class="hint" id="exStatus"></p>
