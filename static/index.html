@@ -48,6 +48,10 @@
         <svg class="blur-corners" id="blurCorners"></svg>
         <canvas class="stage-fade" id="fadeCanvas"></canvas>
         <div class="stage-cut" id="stageCut">CUT</div>
+        <div class="stage-titles" id="stageTitles" hidden>
+          <div class="tcard" id="titleCard"></div>
+          <div class="tcounter tl" id="titleCounter" hidden><div class="tlabel">BUILD TIME</div><div class="tval"></div></div>
+        </div>
       </div>
     </div>
     <div class="transport">
@@ -150,6 +154,17 @@
           <option value="B">B only</option>
         </select>
       </label>
+      <label>Speed here
+        <select id="pieceSpeed">
+          <option value="1">Normal</option>
+          <option value="1.5">1.5× faster</option>
+          <option value="2">2× faster</option>
+          <option value="3">3× faster</option>
+          <option value="4">4× faster</option>
+          <option value="6">6× faster</option>
+          <option value="8">8× faster</option>
+        </select>
+      </label>
       <div class="row wrap">
         <button id="swapBtn" class="btn" title="W">⇄ Swap PiP here</button>
         <button id="hideABtn" class="btn">Hide A here</button>
@@ -160,8 +175,28 @@
         <button id="clearLayoutsBtn" class="btn small" title="Remove every per-part layout: the default layout applies everywhere">Reset all parts to the default layout</button>
       </div>
       <div class="row wrap">
-        <button id="autoBlurBtn" class="btn" title="Find computer, laptop and phone screens in the selected part (or clip) and blur them there">▭ Blur screens here (auto)</button>
+        <button id="autoBlurBtn" class="btn" title="Find computer, laptop and phone screens in the selected part or clip (or the whole video when nothing is selected) and blur them there">▭ Blur screens (auto)</button>
       </div>
+      <label>Blur strength <input type="range" id="blurStrength" min="0" max="1.5" step="0.05"><output id="blurStrengthOut"></output></label>
+    </details>
+
+    <details open id="titlesPanel">
+      <summary>Titles</summary>
+      <label>Intro title <input type="text" id="tiTitle" placeholder="e.g. Building a humanoid robot"></label>
+      <label>Intro subtitle <input type="text" id="tiSub" placeholder="e.g. 62 hours of work in 8 minutes"></label>
+      <label>Intro length <input type="range" id="tiIntroDur" min="2" max="10" step="0.5"><output id="tiIntroDurOut"></output></label>
+      <div class="sublabel">Chapters</div>
+      <div class="mlist" id="chapterList"></div>
+      <div class="row wrap"><button id="chapterAdd" class="btn small">＋ Chapter at playhead</button></div>
+      <label>Chapter title length <input type="range" id="tiChDur" min="1.5" max="6" step="0.5"><output id="tiChDurOut"></output></label>
+      <label>End notes (one line each, the first one big)
+        <textarea id="tiOutro" rows="4" placeholder="Thanks for watching&#10;Built at …&#10;Music: …"></textarea></label>
+      <label>End notes length <input type="range" id="tiOutroDur" min="3" max="15" step="0.5"><output id="tiOutroDurOut"></output></label>
+      <label class="check"><input type="checkbox" id="tiCounter"> Show the build time counter</label>
+      <label>Counter corner
+        <select id="tiCorner"><option value="tl">Top left</option><option value="tr">Top right</option><option value="bl">Bottom left</option><option value="br">Bottom right</option></select>
+      </label>
+      <p class="hint" id="titleInfo"></p>
     </details>
 
     <details open id="textPanel">

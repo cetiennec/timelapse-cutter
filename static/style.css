@@ -152,3 +152,27 @@ dialog .check { display: flex; gap: 6px; align-items: center; grid-template-colu
 .blur-corners rect.textmark { fill: none; stroke: #ff5a6a; stroke-width: 2; }
 label.inline { display: inline-flex; gap: 4px; align-items: center; margin: 0; color: var(--muted); }
 .inspector label.inline > select { width: auto; }
+.inspector input[type=text], .inspector textarea {
+  grid-column: 1 / -1; width: 100%; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 4px 6px; color: var(--text); font: inherit; font-size: 12px; user-select: text; -webkit-user-select: text;
+}
+.inspector textarea { resize: vertical; }
+.sublabel { color: var(--muted); font-size: 12px; margin: 10px 0 4px; }
+.chrow input.chname { flex: 1; min-width: 0; background: transparent; border: 0; padding: 1px 2px; }
+.chrow .chat { font-variant-numeric: tabular-nums; font-size: 11px; white-space: nowrap; }
+.chrow .chat:disabled { opacity: .6; cursor: default; }
+.stage-titles { position: absolute; inset: 0; z-index: 12; pointer-events: none; container-type: size; font-family: "Helvetica Neue", Helvetica, sans-serif; color: #fff; }
+.stage-titles .tcard { position: absolute; inset: 0; opacity: 0; text-shadow: 0.2cqh 0.2cqh 0 rgba(0,0,0,.6); }
+.tcard.intro, .tcard.outro { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; background: rgba(0,0,0,.55); }
+.tcard.outro { background: rgba(0,0,0,.69); }
+.tcard.intro .tmain { font-weight: 700; font-size: 8.5cqh; }
+.tcard.outro .tmain { font-weight: 700; font-size: 5.9cqh; }
+.tcard .tsub { font-size: 3.7cqh; color: #e1e4e8; margin-top: 1.2cqh; }
+.tcard.chapter { background: linear-gradient(to bottom, transparent 55%, rgba(0,0,0,.66)); }
+.tcard.chapter .tnum { position: absolute; left: 7.4cqh; bottom: 15.6cqh; font-weight: 700; font-size: 2.4cqh; color: #ffd60a; }
+.tcard.chapter .tmain { position: absolute; left: 7.4cqh; bottom: 8.3cqh; font-weight: 700; font-size: 5.9cqh; }
+.stage-titles .tcounter { position: absolute; background: rgba(0,0,0,.41); border-radius: 1.3cqh; padding: 1.2cqh 2cqh; min-width: 19cqh; }
+.tcounter.tl { left: 5.6cqh; top: 3.7cqh; } .tcounter.tr { right: 5.6cqh; top: 3.7cqh; text-align: right; }
+.tcounter.bl { left: 5.6cqh; bottom: 5.6cqh; } .tcounter.br { right: 5.6cqh; bottom: 5.6cqh; text-align: right; }
+.tcounter .tlabel { font-weight: 700; font-size: 1.85cqh; color: #ffd60a; }
+.tcounter .tval { font-weight: 700; font-size: 5.2cqh; line-height: 1.05; }

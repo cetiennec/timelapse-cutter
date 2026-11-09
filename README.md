@@ -78,7 +78,16 @@ Run the same command again to continue where you left off.
   trapezoid for a screen seen at an angle, a few more corners when the lens bends its edges.
   Needs `python3 -m pip install torch transformers`; the models (~600 MB + ~375 MB) download on first use.
   To adjust an area, click its clip: its corners show as yellow dots on the preview, drag them (a drawn
-  box becomes a four-corner shape this way).
+  box becomes a four-corner shape this way). With nothing selected it looks through the whole video, a
+  minute at a time, on the cameras that are shown. **Blur strength** makes every blur lighter or stronger
+  (0 turns blurring off without removing the areas).
+- **Speed per part.** **Speed here** (Edit panel) plays the selected part 1.5× to 8× faster in the preview and
+  the export, on top of the export's overall speed; such parts show a blue mark and their speed on the Output row.
+- **Titles.** The Titles panel adds an intro (title and subtitle over the first seconds, on a darkened frame),
+  chapter titles (📍 starts a chapter at the playhead; its name shows at the bottom left for a few seconds) and
+  end notes over the last seconds (one line each, the first one big). **Show the build time counter** adds the
+  real time of work filmed so far in a corner (nights and breaks between recordings don't count), from 0 h 00
+  at the first kept moment. The preview shows all of it; the export draws it in one last pass.
 - **Readable text.** **🔍 Check for readable text** (Readable text panel) reads the text visible in the kept
   parts, or the selected part, with Apple Vision (built into macOS; a small Swift helper, `ocr.swift`, is
   compiled on first use, which needs the Xcode command-line tools). It takes a frame every 0.5–5 s of the final

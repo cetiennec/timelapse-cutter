@@ -1135,7 +1135,7 @@ def run_ffmpeg(cmd, what):
 
 def render_segment(seg, first, nframes, out, ctx, enc):
     """Render output frames [first, first + nframes) of one segment."""
-    fps, speed = ctx["fps"], ctx["speed"]
+    fps, speed = ctx["fps"], float(seg.get("speed") or ctx["speed"])   # parts can be sped up
     skip = first * speed / fps
     cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y"]
     blurs, offs = {}, {}
@@ -1149,9 +1149,9 @@ def render_segment(seg, first, nframes, out, ctx, enc):
                 raise RuntimeError(f"unknown clip {s['clip']}")
             if "blur" in seg:   # the UI sends the boxes active in this segment
                 boxes = list((seg["blur"] or {}).get(key) or [])
-            if boxes:
-                blurs[key.upper()] = (boxes, max(6.0, 0.02 * min(clip["width"] or 1080, clip["height"] or 1080)),
-                                      (clip["width"] or 1920, clip["height"] or 1080))
+            sigma = max(6.0, 0.02 * min(clip["width"] or 1080, clip["height"] or 1080)) * ctx.get("blur", 1.0)
+            if boxes and sigma >= 0.5:
+                blurs[key.upper()] = (boxes, sigma, (clip["width"] or 1920, clip["height"] or 1080))
             k = float(s.get("stretch") or 1)   # timeline seconds per second of this file
             # Start on the file's frame shown at the wanted time, seeking half a frame before
             # it: seeking to the exact time drops a frame shown since just before (always the
@@ -1197,12 +1197,134 @@ def render_dissolve(prev, cur, d, out, ctx):
                 "-video_track_timescale", "30000", out], "dissolve")
 
 
+# ---------------------------------------------------------------- titles and counter
+
+FONT = "/System/Library/Fonts/HelveticaNeue.ttc"   # regular = face 0, bold = face 1 (same as the preview)
+
+
+def font(size, bold=False):
+    from PIL import ImageFont
+    try:
+        return ImageFont.truetype(FONT, int(size), index=1 if bold else 0)
+    except OSError:
+        return ImageFont.load_default(size=int(size))
+
+
+def text_card(card, W, H, path):
+    """A transparent W x H picture of one title: the intro and the end notes over a
+    darkened frame, chapter titles at the bottom left."""
+    from PIL import Image, ImageDraw
+    k = H / 1080
+    im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    shadow = (0, 0, 0, 150)
+
+    def line(xy, text, f, fill=(255, 255, 255, 255), anchor="la"):
+        d.text((xy[0] + 2 * k, xy[1] + 2 * k), text, font=f, fill=shadow, anchor=anchor)
+        d.text(xy, text, font=f, fill=fill, anchor=anchor)
+
+    if card["kind"] == "chapter":
+        band = Image.new("L", (1, H), 0)   # soft shade under the title
+        for y in range(H):
+            band.putpixel((0, y), int(170 * max(0.0, (y - 0.55 * H) / (0.45 * H)) ** 1.4))
+        im.paste(Image.new("RGBA", (W, H), (0, 0, 0, 255)), (0, 0), band.resize((W, H)))
+        x, y = 80 * k, H - 90 * k
+        if card.get("num"):
+            line((x, y - 78 * k), card["num"].upper(), font(26 * k, True), (255, 214, 10, 255), "ls")
+        line((x, y), card.get("title", ""), font(64 * k, True), anchor="ls")
+    else:
+        im.paste((0, 0, 0, 175 if card["kind"] == "outro" else 140), (0, 0, W, H))
+        lines = [card.get("title", "")] + ([card["sub"]] if card.get("sub") else []) if card["kind"] == "intro" \
+            else [l for l in (card.get("lines") or "").split("\n")]
+        sizes = [(92 if card["kind"] == "intro" else 64) * k] + [40 * k] * (len(lines) - 1)
+        gaps = [s * 1.35 for s in sizes]
+        y = H / 2 - sum(gaps) / 2 + sizes[0] * 0.8
+        for i, (l, sz) in enumerate(zip(lines, sizes)):
+            if l.strip():
+                line((W / 2, y), l, font(sz, i == 0), (255, 255, 255, 255) if i == 0 else (225, 228, 232, 255), "ms")
+            y += gaps[i] if i + 1 >= len(gaps) else (gaps[i] + gaps[i + 1]) / 2
+    im.save(path)
+
+
+def counter_image(minutes, W, H, corner, path):
+    from PIL import Image, ImageDraw
+    k = H / 1080
+    w, h = int(250 * k), int(112 * k)
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    if minutes is not None:
+        d = ImageDraw.Draw(im)
+        d.rounded_rectangle((0, 0, w - 1, h - 1), radius=int(14 * k), fill=(0, 0, 0, 105))
+        right = corner.endswith("r")
+        x, anchor = (w - 22 * k, "r") if right else (22 * k, "l")
+        for dx, fill in ((2 * k, (0, 0, 0, 150)), (0, (255, 255, 255, 235))):
+            d.text((x + dx, 34 * k + dx), "BUILD TIME", font=font(20 * k, True),
+                   fill=(255, 214, 10, 255) if dx == 0 else fill, anchor=anchor + "s")
+            d.text((x + dx, 92 * k + dx), f"{minutes // 60} h {minutes % 60:02d}", font=font(56 * k, True),
+                   fill=fill, anchor=anchor + "s")
+    im.save(path)
+
+
+def add_overlays(video, out, ov, ctx, tmp):
+    """Draw the title cards and the build-time counter over the joined video."""
+    W, H, fps = ctx["W"], ctx["H"], ctx["fps"]
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video],
+                       capture_output=True, text=True)
+    dur = float(r.stdout.strip())
+    folder = os.path.join(tmp, "titles")
+    os.makedirs(folder, exist_ok=True)
+    inputs, chain, cur, n = [], [], "0:v", 1
+    for i, c in enumerate(ov.get("cards") or []):
+        t0, d = max(0.0, float(c["t0"])), float(c["dur"])
+        d = min(d, dur - t0)
+        if d <= 0.05:
+            continue
+        png = os.path.join(folder, f"card{i}.png")
+        text_card(c, W, H, png)
+        fi, fo = min(float(c.get("fadeIn", 0.6)), d / 2), min(float(c.get("fadeOut", 0.6)), d / 2)
+        inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-t", f"{d:.3f}", "-i", png]
+        chain.append(f"[{n}:v]format=rgba,fade=t=in:st=0:d={fi:.3f}:alpha=1,"
+                     f"fade=t=out:st={d - fo:.3f}:d={fo:.3f}:alpha=1,setpts=PTS-STARTPTS+{t0:.3f}/TB[c{n}];"
+                     f"[{cur}][c{n}]overlay=eof_action=pass:enable='between(t,{t0:.3f},{t0 + d:.3f})'[v{n}]")
+        cur, n = f"v{n}", n + 1
+    cnt = ov.get("counter") or {}
+    events = sorted((float(t), m) for t, m in cnt.get("events") or [])
+    if events:
+        corner = cnt.get("corner", "tl")
+        lst, made = [], {}
+        times = [0.0] + [t for t, _ in events] + [dur]
+        values = [None] + [None if m is None or m < 0 else m for _, m in events]
+        for (a, b), m in zip(zip(times, times[1:]), values):
+            if b - a <= 1e-3:
+                continue
+            key = "off" if m is None else int(m)
+            if key not in made:
+                made[key] = os.path.join(folder, f"n_{key}.png")
+                counter_image(None if m is None else int(m), W, H, corner, made[key])
+            lst.append(f"file '{made[key]}'\nduration {b - a:.4f}\n")
+        lst.append(f"file '{made[key]}'\n")   # the concat demuxer needs the last file twice
+        txt = os.path.join(folder, "counter.txt")
+        with open(txt, "w") as f:
+            f.writelines(lst)
+        inputs += ["-f", "concat", "-safe", "0", "-i", txt]
+        m = int(60 * H / 1080)
+        x = f"W-w-{m}" if corner.endswith("r") else str(m)
+        y = f"H-h-{m}" if corner.startswith("b") else str(int(40 * H / 1080))
+        chain.append(f"[{n}:v]format=rgba[k{n}];[{cur}][k{n}]overlay=x={x}:y={y}:eof_action=repeat[v{n}]")
+        cur, n = f"v{n}", n + 1
+    if cur == "0:v":
+        shutil.copy(video, out)
+        return
+    run_ffmpeg(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", video, *inputs,
+                "-filter_complex", ";".join(chain), "-map", f"[{cur}]", "-t", f"{dur:.3f}",
+                *encoder_args(ctx["encoder"]), "-pix_fmt", "yuv420p", "-movflags", "+faststart", out], "titles")
+
+
 def export_worker(job):
     try:
         out = job["output"]
         ctx = {"layout": job["layout"], "W": even(out["width"]), "H": even(out["height"]),
                "fps": float(job.get("fps", 30.0)), "speed": max(0.1, float(out.get("speed", 1.0))),
-               "encoder": out.get("encoder")}
+               "encoder": out.get("encoder"), "blur": max(0.0, float(job.get("blurStrength", 1.0)))}
         # Each segment carries its output length in frames and `fade`, the number of
         # frames it cross-fades with the previous segment (computed by the UI).
         segs = [s for s in job["segments"] if int(s.get("frames", 0)) >= 1]
@@ -1251,12 +1373,19 @@ def export_worker(job):
             f.writelines(f"file '{p}'\n" for p in parts)
         EXPORT["step"] = "joining"
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        joined = os.path.join(tmp, "joined.mp4") if music["tracks"] else path
+        ov = job.get("overlays") or {}
+        has_ov = bool(ov.get("cards") or (ov.get("counter") or {}).get("events"))
+        joined = os.path.join(tmp, "joined.mp4") if music["tracks"] or has_ov else path
         r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0",
                             "-i", lst, "-c", "copy", "-movflags", "+faststart", joined],
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip()[-800:])
+        if has_ov:
+            EXPORT["step"] = "adding titles"
+            titled = os.path.join(tmp, "titled.mp4") if music["tracks"] else path
+            add_overlays(joined, titled, ov, ctx, tmp)
+            joined = titled
         if music["tracks"]:
             EXPORT["step"] = "adding music"
             mux_music(joined, path, music)
@@ -1422,7 +1551,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "bad json"}, 400)
         if p == "/api/state":
             with LOCK:
-                for k in ("cuts", "keeps", "splits", "overrides", "hidden", "layout", "detect", "transitions", "output", "settings", "tracks", "music", "blurs"):
+                for k in ("cuts", "keeps", "splits", "overrides", "speeds", "hidden", "layout", "detect", "transitions",
+                          "output", "settings", "tracks", "music", "blurs", "titles"):
                     if k in data:
                         STATE[k] = data[k]
                 if "clips" in data:
