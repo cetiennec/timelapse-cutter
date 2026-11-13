@@ -200,5 +200,6 @@ label.inline { display: inline-flex; gap: 4px; align-items: center; margin: 0; c
 dialog.wide { width: min(980px, calc(100vw - 32px)); }
 #previewVideo { width: 100%; border-radius: 6px; background: #000; }
 .stage-book { position: absolute; inset: 0; z-index: 30; background: #161514; display: flex; align-items: center; justify-content: center; }
+.stage-book[hidden] { display: none; }
 .stage-book video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transition: opacity .15s; }
 .stage-book .book-msg { position: relative; color: #6e6a60; font-size: 13px; }
